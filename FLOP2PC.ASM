@@ -171,7 +171,6 @@ waitNak	call	chkQuit		;give user chance to abort
 
 haveNak	xra	a		;init track we want to zero
 	sta	trkNum
-	sta	lastSec		;last sector accessed
 
 	inr	a		;init xmodem block number to one
 	sta	blkNum
@@ -246,24 +245,7 @@ readTrk	lxi	h,trkNum	;get desired track from trkNum
 	mvi	a,2		;init retry step
 	sta	rtStep
 
-; To make sure the head is settled following the track step, yet still
-;    minimize latency, add 4 to the last sector number accessed (and
-;    wrap as needed). When this sector number is used in the call to
-;    dNxtSec, a total delay of about 24 ms has transpired since the step
-;    was issued. This give 10ms for the step plus 14 ms of head settle time.
-
-	lda	numSecs
-	mov	b,a
-	inr	b		;numSecs+1
-	lda	lastSec		;last sector accessed
-	adi	4		;bump by four sector times
-	cmp	b		;past 26/50?
-	jc	noWrap
-
-	dcr	b
-	sub	b		;wrap to sector 1-n
-
-noWrap	mov	e,a		;e=new "last" sector number
+	mvi	e,0		;reset sector
 
 ; Read an entire track. Start after the sector in e. 
 
@@ -1308,8 +1290,8 @@ dSelDrv	lda	drvNum		;a=desired drive
 ;    e = next sector sector number
 ;    bc = byte offset of this sector in a track
 ;--------------------------------------------------------------
-dNxtSec	inr	e		;move to next sector
-	jz	dSec1		;in case uninitialized rolled to 0
+dNxtSec	inr	e		;move to next staggered sector
+	inr	e		;skew of 2
 
 	lda	numSecs
 	mov	b,a
@@ -1333,7 +1315,6 @@ dSec1	mvi	e,1		;restart at sector 1
 ;    bc = byte offset of this sector in a track
 ;--------------------------------------------------------------
 dWtSec	mov	a,e		;save the computed sector
-	sta	lastSec
 
 ; compute bc=128*(sector-1)
 
@@ -1357,7 +1338,6 @@ dWtSec	mov	a,e		;save the computed sector
 drvNum	ds	1		;drive number to use
 trkNum	ds	1		;track number to read
 numSecs	ds	1		;number of sectors in track
-lastSec	ds	1		;last sector accessed on track
 fWaitHd	ds	1		;E bit (wait head settle) flag
 trkPtr	ds	2		;pointer into trkBuf at track boundaries
 bufEnd	ds	2		;end address + 1 of last track spot in RAM
@@ -1409,7 +1389,7 @@ NIBOUT	ADI	'0'
 	RET
 
 ;------------------------------------------------------------------------------
-; PR$HEX - DISPLAY VALUE IN A AS A TWO DIGIT ASCII-HEXIDECIMAL VALUE.
+; PR$BYT - DISPLAY VALUE IN A AS A TWO DIGIT ASCII-HEXIDECIMAL VALUE.
 ; CLOBBERS NONE.
 ;------------------------------------------------------------------------------
 PR$BYT	PUSH	A
