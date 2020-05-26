@@ -1,0 +1,1772 @@
+
+
+                ;*****************************************************************************
+                ;
+                ;  Flop2PC - Transfer floppy image to PC over a serial port
+                ;		(for JADE Double D controller)
+                ;
+                ;	This program transmits an image of a SSSD soft-sectored 8" floppy
+                ;	to a PC. The image is transmitted through a 2SIO at I/O address
+                ;	010h or 012h, or an SIO at address 0 using the XMODEM protocol.
+                ;
+                ;	The program talks directly to the JADE Double D  controller and
+                ;	does not require CP/M or an OS to function.
+                ;
+                ;	This program works best if console port and the transfer port
+                ;	are not the same device. Otherwise, most error messages won't
+                ;	be seen as the file transfer dialog box prevents their display.
+                ;
+                ;	The program runs standalone at 0x100 or under CP/M. The program
+                ;	is exited with a CTRL-C and either warm boots CP/M or just starts
+                ;       over when running stand alone.
+                ;
+                ;	Written by Mike Douglas
+                ;	Modified for JADE Double D by Patrick Linstruth
+                ;
+                ;	Rev	 Date	    Desc
+                ;	1.0	05/24/20    Original
+                ;
+                ;*****************************************************************************
+                
+                ; Disk information equates
+                
+ 004D =         NUMTRK	equ	77		;number of tracks
+ 001A =         NUMSEC	equ	26		;number of sectors per track
+ 0032 =         NUMSEC1	equ	50		;number of sectors per track
+ 0018 =         XTRASEC	equ	(NUMSEC1-NUMSEC);extra sectors to read on first pass
+ 0080 =         SECLEN	equ	128		;sector length (as transmitted)
+ 0000 =         MINDRV	equ	0		;first drive number
+ 0003 =         MAXDRV	equ	3		;max drive number 
+                
+ 0D00 =         TRKLEN	equ	(NUMSEC*SECLEN)	;length of track in bytes
+ 1900 =         TRKLEN1	equ	(NUMSEC1*SECLEN);length of track in bytes
+ 0C00 =         XTRALEN	equ	(XTRASEC*SECLEN);extra length of track 1
+ 0003 =         RDTRIES	equ	3		;disk retries per retry step
+                
+                ; Specify head settle delay (in addition to the 10ms step delay provided
+                ;    by the 1771), and the amount of time to delay between reversing
+                ;    track steps (e.g., step in/out or step out/in sequence). 
+                ;
+                ; Set ONEMS to give a 1ms delay for a 19 cycle loop (8080) or a 18 cycle
+                ;    loop (Z80)
+                
+ 000A =         HDSETL	equ	10		;10ms additional head settle after step
+ 000A =         STPREV	equ	10		;10ms delay when reversing step direction
+ 0069 =         ONEMS	equ	105		;105*19 cycles = 1ms at 2Mhz (8080)
+                ;ONEMS	equ	267		;222*18 cycles = 1ms at 4Mhz (Z80)
+                
+                ; Monitor, CP/M boot entry points
+                
+                MONITOR	set	init		;no monitor, just start over
+                CPMBOOT	set	0		;CP/M warm boot jump vector
+                
+                ; XMODEM equates
+                
+ 0080 =         PKTLEN	equ	128		;128 byte xmodem packet length
+ 0001 =         SOH	equ	001h
+ 0004 =         EOT	equ	004h
+ 0006 =         ACK	equ	006h
+ 0015 =         NAK	equ	015h
+ 001A =         EOF	equ	01ah		;ctrl-z character
+ 000A =         XMTRIES	equ	10		;number of xmodem retries
+                
+                ; CP/M Equates
+                
+ 0000 =         WBOOT	equ	0		;warm boot jump vector
+                
+                ; Misc equates
+                
+ 000D =         CR	equ	13		;ascii for carriage return
+ 000A =         LF	equ	10		;ascii for line feed
+ 007F =         DEL	equ	7fh		;ascii DEL
+ 0008 =         BS	equ	08h		;ascii backspace
+ 0003 =         CTRLC	equ	03		;ascii for control-c
+ 00C3 =         JMPINST	equ	0c3h		;jump instruction opcode
+                
+ 0100           	org	0100h		;load address
+                ;-----------------------------------------------------------------------------
+                ;   Initialize for transfer
+                ;-----------------------------------------------------------------------------
+ 0100 319609    init	lxi	sp,ourStk	;initialize stack pointer
+ 0103 CD5C04    	call	chkCpm		;set flag for CP/M or not
+ 0106 CD9A04    	call	sizeRam		;determine amount of RAM available
+ 0109 CDD507    	call	s2Init		;initialize the 88-2SIO ports
+ 010C 3E00      	mvi	a,MINDRV	;a=default drive
+ 010E 32C108    	sta	drvNum		;need for pgmExit
+                
+                ;  Display welcome message, then get the drive number and port number
+                ;    to use for the transfer from the operator.
+                
+ 0111 21F304    	lxi	h,mWelcom	;display welcome message
+ 0114 CD8703    	call	dispMsg
+                
+                ; getDrv - get drive number or letter from the user.
+                
+                ; getDrv - get drive number or letter from the user.
+                
+ 0117 21B705    getDrv	lxi	h,mDrive	;display drive number prompt
+ 011A CD8703    	call	dispMsg
+ 011D CD9203    	call	rcvCon		;get byte from the console
+ 0120 F620      	ori	20h		;upper case letters to lower case
+ 0122 FE78      	cpi	'x'		;exit requested?
+ 0124 CA2A04    	jz	pgmExit		;yes
+                
+ 0127 215509    	lxi	h,baseDrv	;ascii 1st drive - baseDrv = 0
+ 012A 96        	sub	m
+ 012B FE04      	cpi	MAXDRV-MINDRV+1	;validate >=min drive and <= max drive
+ 012D D21701    	jnc	getDrv		;invalid, prompt again
+                
+ 0130 C600      	adi	MINDRV		;restore offset of 1st drive (if any)
+ 0132 32C108    	sta	drvNum		;save the drive number to use
+                
+                ; Check if DCM is running and drive status
+                
+ 0135 CD4C0A    	call	INI$DD
+ 0138 CA4101    	jz	dcmRdy		;DCM found and running
+ 013B CD4B0B    	call	DCM$ER		;display DCM error
+ 013E C31701    	jmp	getDrv
+                
+ 0141 CD8E08    dcmRdy	call	dRestor		;restore to track 0 (selects drive)
+                
+                ; getPort - get serial port number from the user.
+                
+ 0144 21EF05    getPort	lxi	h,mPort		;display transfer port prompt
+ 0147 CD8703    	call	dispMsg
+ 014A CD9203    	call	rcvCon		;get byte from the console
+ 014D F620      	ori	20h		;upper to lower case, nums not affected
+ 014F FE78      	cpi	'x'		;exit requested?
+ 0151 CA2A04    	jz	pgmExit		;yes
+                
+ 0154 D631      	sui	'1'		;'1' - '3' to bianry 0-2
+ 0156 FE03      	cpi	3		;validate ascii 1-3
+ 0158 D24401    	jnc	getPort		;invalid, prompt again
+                
+ 015B 324C09    	sta	xfrPort		;save the port to use
+                
+                ; Prompt the user to start the XMODEM receive operation on the PC. 
+                ;    Wait for a clear receive line for a least one second, then start
+                ;    looking for NAK or 'C' (crc protocol) from the PC
+                
+ 015E 218906    	lxi	h,mStart	;display start file transfer prompt
+ 0161 CD8703    	call	dispMsg
+                
+ 0164 0601      clrRcv1	mvi	b,1		;1 second
+ 0166 CDC903    	call	rcvByte		;loop until input clear for 1 second
+ 0169 C26401    	jnz	clrRcv1
+                
+ 016C AF        	xra	a		;set CRC flag to false (checksum mode)
+ 016D 324F09    	sta	crcFlag
+                
+ 0170 CD1B04    waitNak	call	chkQuit		;give user chance to abort
+ 0173 0601      	mvi	b,1		;1 second timeout
+ 0175 CDC903    	call	rcvByte		;wait for a character
+ 0178 FE15      	cpi	NAK
+ 017A CA8501    	jz	haveNak		;have a NAK, use checksum protocol
+                
+ 017D FE43      	cpi	'C'		;CRC protocol requested?
+ 017F C27001    	jnz	waitNak		;no
+                
+ 0182 324F09    	sta	crcFlag		;set crc flag non-zero = CRC mode
+                
+                ;  NAK or 'C' received meaning the XMODEM receive has started. Initialize
+                ;     for the transfer.
+                
+ 0185 AF        haveNak	xra	a		;init track we want to zero
+ 0186 32C208    	sta	trkNum
+                
+ 0189 3C        	inr	a		;init xmodem block number to one
+ 018A 324E09    	sta	blkNum
+                
+ 018D 215C0B    	lxi	h,trkBuf	;trkBuf is initial starting point for
+ 0190 225209    	shld	sndPtr		;   XMODEM send
+                
+                ;-----------------------------------------------------------------------------
+                ;  mainLp - Loop through all tracks on the disk buffering as many tracks
+                ;    as will fit in RAM before sending via xmodem, then repeat.
+                ;-----------------------------------------------------------------------------
+ 0193 215C0B    mainLp	lxi	h,trkBuf	;disk buffering always start at trkBuf
+ 0196 22C508    	shld	trkPtr
+                
+                ; Read and buffer bufTrks tracks unless all tracks on drive reached first
+                
+ 0199 CDD901    bufLoop	call	readTrk		;read into trkBuf
+                
+ 019C 3AC208    	lda	trkNum		;increment track number (preserve HL)
+ 019F 3C        	inr	a
+ 01A0 32C208    	sta	trkNum	
+ 01A3 FE4D      	cpi	NUMTRK		;done all tracks on the disk?
+ 01A5 CAB901    	jz	sendBuf		;yes, go send the buffered tracks
+                
+ 01A8 3A4B09    	lda	trkErr		;read failure on the track?
+ 01AB B7        	ora	a		;if so, send buffered tracks now
+ 01AC C2B901    	jnz	sendBuf		;so XMODEM won't time out
+                
+ 01AF EB        	xchg			;de=current track pointer
+ 01B0 2AC708    	lhld	bufEnd		;hl=end of buffering space
+ 01B3 CDDB04    	call	cmpDeHl		;compare current-end
+ 01B6 DA9901    	jc	bufLoop		;still room, keep going	
+                
+                ; Track buffer is full or all tracks have been read. Send the buffered
+                ;    tracks via xmodem.
+                
+ 01B9 CD7A02    sendBuf	call	sndTrks		;send the buffered tracks via xmodem
+ 01BC 3AC208    	lda	trkNum
+ 01BF FE4D      	cpi	NUMTRK		;done all tracks?
+ 01C1 C29301    	jnz	mainLp		;no, not done yet
+                
+                ; The entire disk has been read and (mostly) transmitted. See if there are
+                ;    left over bytes to send. If so, send them.
+                
+ 01C4 7D        	mov	a,l		;hl->next packet to send, a=lsb of ptr
+ 01C5 FE5C      	cpi	trkBuf AND 0ffh	;pointing to lsb of address of trkBuf?
+ 01C7 CACD01    	jz	noExtra		;same, no extra bytes to send
+                
+ 01CA CDB002    	call	sndPkt		;otherwise, send one last packet
+                
+                ; Send EOT and wait for response. Then display the success message and
+                ;    start the program over.
+                
+ 01CD CD6203    noExtra	call	sndEot		;send and get response for EOT
+ 01D0 21BC06    	lxi	h,mDone		;print the all done message
+ 01D3 CD8703    	call	dispMsg
+ 01D6 C31701    	jmp	getDrv		;start over asking for a drive
+                	
+                ;-----------------------------------------------------------------------------
+                ; readTrk - read numSecs sectors from the current track into a trkBuf as
+                ;   pointed to by trkPtr. After the track is read, trkPtr is updated
+                ;   by the length of a track to point to the next track buffer. This
+                ;   saved value is also returned in HL.
+                ;-----------------------------------------------------------------------------
+ 01D9 21C208    readTrk	lxi	h,trkNum	;get desired track from trkNum	
+ 01DC 6E        	mov	l,m		;and put into l
+ 01DD CD8708    	call	dSeek		;seek to the track
+                
+ 01E0 AF        	xra	a
+ 01E1 324B09    	sta	trkErr		;no error on this track yet
+                
+ 01E4 3E02      	mvi	a,2		;init retry step
+ 01E6 324A09    	sta	rtStep
+                
+ 01E9 1E00      	mvi	e,0		;reset sector
+                
+                ; Read an entire track. Start after the sector in e. 
+                
+ 01EB 3AC308    	lda	numSecs
+ 01EE 57        	mov	d,a		;d=sector counter
+                
+ 01EF CDA908    secLoop	call	dNxtSec		;e=next sector, bc=offset within track
+                
+ 01F2 2AC508    stpLoop	lhld	trkPtr		;hl->start of current track buffer
+ 01F5 09        	dad	b		;hl->sector buffer
+                
+ 01F6 CD1B04    	call	chkQuit		;check for ctrl-c from operator
+                
+ 01F9 CD4608    	call	dRead		;read the sector
+ 01FC C21902    	jnz	secRtry		;error, run retry logic	
+                
+                ; Decrement sector count. If full track is done, increment trkPtr
+                ;   to point to the next track buffer in trkBuf and exit.
+                
+ 01FF 15        nxtSec	dcr	d		;decrement sector count
+ 0200 C2EF01    	jnz	secLoop
+                
+ 0203 2AC508    	lhld	trkPtr		;hl=current track pointer
+ 0206 110019    	lxi	d,TRKLEN1	;de=bytes in a track 1
+ 0209 3AC208    	lda	trkNum		;track 1?
+ 020C FE01      	cpi	1
+ 020E CA1402    	jz	trk1
+                
+ 0211 11000D    	lxi	d,TRKLEN	;de=bytes in a track 0,2-76
+ 0214 19        trk1	dad	d		;hl=start of next track in trkBuf
+ 0215 22C508    	shld	trkPtr
+ 0218 C9        	ret
+                
+                ;--------------------------------------------------------------------------
+                ; secRtry - Read error retry logic. Three retry steps are tried in
+                ;   the order shown below:
+                ;
+                ;   Step    Action
+                ;    2	Re-read RDTRIES times
+                ;    1	Seek out one track and back, then re-read RDTRIES times
+                ;    0	Seek in one track and back, then re-read RDTRIES times
+                ;
+                ;    Upon entry, if the error is "sector not found," then retries are
+                ;    not performed since the controller has already tried to read the
+                ;    address mark across three revolutions.
+                ;--------------------------------------------------------------------------	
+ 0219 E610      secRtry	ani	ST$RNF		;sector not found error?
+ 021B C23A02    	jnz	nxtStep		;yes, skip retries, go to next step
+                
+ 021E 3E03      	mvi	a,RDTRIES	;init retry counter
+ 0220 324909    	sta	rdRtry
+                
+ 0223 CDB708    retryLp	call	dWtSec		;get bc=offset of sector e in track
+ 0226 2AC508    	lhld	trkPtr		;hl->start of current track buffer
+ 0229 09        	dad	b		;hl->sector buffer
+                
+ 022A CD1B04    	call	chkQuit		;check for ctrl-c
+                	
+ 022D CD4608    	call	dRead		;read the sector
+ 0230 CA4702    	jz	rtDone		;success, retry is done
+                
+ 0233 214909    	lxi	h,rdRtry	;decrement retry counter
+ 0236 35        	dcr	m
+ 0237 C22302    	jnz	retryLp		;try again
+                
+                ; nxtStep - move to the next retry step
+                
+ 023A 214A09    nxtStep	lxi	h,rtStep	;decrement to next retry step
+ 023D 35        	dcr	m
+                		
+ 023E CA5602    	jz	skPast		;step 0, step in one track and come back	
+ 0241 F24F02    	jp	skBack		;step 1, step out one track and come back
+                
+                ; All retry steps failed. Display the error, then jump back into the main
+                ;    read loop which will resume at the next sector.
+                
+ 0244 CDDE03    	call	dspErr		;give up, display the error
+                
+                ; rtDone - retry logic is done. Reset the retry step counter and
+                ;    jump to end of sector processing above
+                
+ 0247 3E02      rtDone	mvi	a,2		;restart retry step counter
+ 0249 324A09    	sta	rtStep
+ 024C C3FF01    	jmp	nxtSec
+                
+                ;-----------------------------------------------------------------------------
+                ; skBack - step out then back in, retry read
+                ; skPast - step in then back out, retry read
+                ;-----------------------------------------------------------------------------
+ 024F 3AC208    skBack	lda	trkNum		;a=current track
+ 0252 3D        	dcr	a		;move out one track
+ 0253 F25F02    	jp	doBump		;not before track zero, do the step out
+                
+ 0256 3AC208    skPast	lda	trkNum		;a=current track
+ 0259 3C        	inr	a		;move in one track
+ 025A FE4D      	cpi	NUMTRK		;past end?
+ 025C D24F02    	jnc	skBack		;yes, do seek back instead
+                	
+ 025F 6F        doBump	mov	l,a
+ 0260 CD8708    	call	dSeek		;issue step out or in
+                
+ 0263 3E0A      	mvi	a,STPREV	;delay for step direction reversal
+ 0265 CDE704    	call	delayMs
+                
+ 0268 21C208    	lxi	h,trkNum	;get desired track from trkNum
+ 026B 6E        	mov	l,m		;and put into l
+ 026C CD8708    	call	dSeek		;seek back to the track
+                
+ 026F 3E0A      	mvi	a,HDSETL	;delay head settle time after step
+ 0271 CDE704    	call	delayMs
+                
+ 0274 CDB708    	call	dWtSec		;get bc=offset of sector within track
+ 0277 C3F201    	jmp	stpLoop		;start reads for new step
+                
+                ;-----------------------------------------------------------------------------
+                ; sndTrks - send the tracks buffered in trkBuf via xmodem. trkPtr points
+                ;    to the end+1 of the data to send
+                ;-----------------------------------------------------------------------------
+ 027A 2AC508    sndTrks	lhld	trkPtr		;hl=end of buffered data + 1
+ 027D EB        	xchg			;de=end of buffered data + 1
+ 027E 2A5209    	lhld	sndPtr		;hl=start tranmission address
+                
+ 0281 D5        sndLoop	push	d		;save end pointer
+ 0282 CDB002    	call	sndPkt		;send a packet
+ 0285 D1        	pop	d		;de=end pointer
+                
+                ; At this point, hl->start of next packet and de->last byte read from disk+1.
+                ;    If the next XMODEM packet will go past the end of the disk data,
+                ;    we don't want to send it yet.
+                
+ 0286 018000    	lxi	b,PKTLEN	;bc=length of XMODEM packet
+ 0289 09        	dad	b		;hl=address at end of NEXT packet + 1
+ 028A CDDB04    	call	cmpDeHl		;compare disk end - end of next packet
+ 028D DA9702    	jc	sndDone		;next packet will pass the end, stop
+                
+ 0290 0180FF    	lxi	b,-PKTLEN	;restore hl
+ 0293 09        	dad	b
+ 0294 C38102    	jmp	sndLoop
+                
+                ; sndDone - all the packets we can send have been sent. Move any bytes
+                ;    left over to just before the start of trkBuf. The next group of
+                ;    xmodem packets will be transmitted starting there.
+                
+ 0297 CDE004    sndDone	call	subDeHl		;hl=de-hl = left over byte count - PKTLEN
+ 029A 7D        	mov	a,l		;a=left over count - PKTLEN
+ 029B C680      	adi	PKTLEN		;a=left over byte count
+ 029D 47        	mov	b,a		;b=count of bytes to move
+ 029E 215C0B    	lxi	h,trkBuf	;hl->start of trkBuf
+ 02A1 CAAC02    	jz	mvDone		;no bytes to move, we're done
+                
+                ; Copy the leftover data backwards to just before the track buffer. The
+                ;   next XMODEM send sequence will start at the beginning of this copied
+                ;   data instead of at the start of trkBuf.
+                
+ 02A4 2B        moveLp	dcx	h		;hl->memory just before trkBuf
+ 02A5 1B        	dcx	d		;de->unsent bytes from end of trkBuf
+ 02A6 1A        	ldax	d		;move from end of trkBuf to before trkBuf
+ 02A7 77        	mov	m,a	
+ 02A8 05        	dcr	b
+ 02A9 C2A402    	jnz	moveLp
+                
+ 02AC 225209    mvDone	shld	sndPtr		;save address from which to send next time
+ 02AF C9        	ret
+                
+                ;-----------------------------------------------------------------------------
+                ; sndPkt - send an xmodem format 128 byte packet. HL points to the 128 byte
+                ;    buffer to send. On exit, HL points to the next 128 byte boundary.
+                ;-----------------------------------------------------------------------------
+ 02B0 3E0A      sndPkt	mvi	a,XMTRIES	;init retry counter
+ 02B2 324D09    	sta	xmRetry
+                
+                ; First, send header bytes
+                
+ 02B5 CD1B04    reSend	call	chkQuit		;check for ctrl-c
+ 02B8 E5        	push	h		;save hl for possible re-send
+ 02B9 3E01      	mvi	a,SOH		;1st byte is SOH
+ 02BB CDC003    	call	sndByte
+ 02BE 3A4E09    	lda	blkNum		;2nd byte is the block number
+ 02C1 CDC003    	call	sndByte
+ 02C4 2F        	cma			;2nd complement of block number
+ 02C5 CDC003    	call	sndByte
+                
+                ; Init checksum and CRC and packet length for transmission of data portion
+                
+ 02C8 AF        	xra	a		;init crc
+ 02C9 325009    	sta	crc16
+ 02CC 325109    	sta	crc16+1
+ 02CF 110080    	lxi	d,PKTLEN*256	;d=byte counter, e=0 (checksum)
+                
+                ; Loop sending the data bytes and updating checksum and CRC
+                
+ 02D2 7E        pktLoop	mov	a,m
+ 02D3 CDC003    	call	sndByte		;send and update checksum in e
+ 02D6 CD4203    	call	calCrc		;update the CRC
+ 02D9 23        	inx	h		;point to next byte
+ 02DA 15        	dcr	d		;decrement bytes remaining
+ 02DB C2D202    	jnz	pktLoop
+                
+                ; Send checksum or CRC based on crcFlag
+                
+ 02DE 3A4F09    	lda	crcFlag		;crc or checksum?
+ 02E1 B7        	ora	a
+ 02E2 CAF102    	jz	sndCsum		;flag clear = checksum
+                
+ 02E5 3A5109    	lda	crc16+1		;a=high byte of CRC
+ 02E8 CDC003    	call	sndByte		;send it
+ 02EB 3A5009    	lda	crc16		;a=low byte of crc
+ 02EE C3F202    	jmp	sndSkip		;skip next instruction	
+                
+ 02F1 7B        sndCsum	mov	a,e		;send the checksum byte
+                
+ 02F2 CDC003    sndSkip	call	sndByte
+                
+                ;  All bytes sent. Wait for the response.
+                
+ 02F5 0603      	mvi	b,3		;3 second timeout
+ 02F7 CDC903    	call	rcvByte		;get the response character
+ 02FA CA0B03    	jz	sndFail		;timeout on response
+                
+ 02FD FE06      	cpi	ACK		;ack received?
+ 02FF C20B03    	jnz	sndFail		;no, send failed
+                
+ 0302 3A4E09    	lda	blkNum		;increment block number
+ 0305 3C        	inr	a
+ 0306 324E09    	sta	blkNum
+                
+ 0309 C1        	pop	b		;remove pushed hl, but don't clobber hl
+ 030A C9        	ret
+                
+                ; sndFail - ACK not received, decrement retry and try again.
+                
+ 030B 214D09    sndFail	lxi	h,xmRetry	;point to retry counter
+ 030E 35        	dcr	m
+ 030F CA3603    	jz	xmFail		;retries used up, failed xmodem transfer
+                
+                ; If we've had 3 NAKs on the 1st packet and CRC is selected, assume
+                ;   we took so long to send the 1st packet due to disk retries that
+                ;   the receiver has since timed out and switched to checksum
+                
+ 0312 3A4F09    	lda	crcFlag		;are we in CRC mode
+ 0315 CA2A03    	jz	clrRcv2		;no, ignore the rest of this
+                
+ 0318 3A4E09    	lda	blkNum		;on block 1?
+ 031B 3D        	dcr	a
+ 031C C22A03    	jnz	clrRcv2		;no, go on
+                
+ 031F 3A4D09    	lda	xmRetry		;failed three times in a row on block 1?
+ 0322 D607      	sui	XMTRIES-3
+ 0324 C22A03    	jnz	clrRcv2		;no
+                
+ 0327 324F09    	sta	crcFlag		;clear crcFlag to force checksum
+                
+                ;  clrRcv2 - wait for one second of line clear time and send packet again.
+                
+ 032A 0601      clrRcv2	mvi	b,1		;1 second timeout
+ 032C CDC903    	call	rcvByte		;wait for 1 second of clear line
+ 032F C22A03    	jnz	clrRcv2
+                
+ 0332 E1        	pop	h		;restore pointer to the packet
+ 0333 C3B502    	jmp	reSend		;re-send the packet
+                
+                ;  xmFail - Display failure message then restart program
+                
+ 0336 21D406    xmFail	lxi	h,mXmdm		;xmodem failure message
+ 0339 CD8703    	call	dispMsg
+                
+ 033C 319609    	lxi	sp,ourStk	;initialize stack pointer
+ 033F C31701    	jmp	getDrv		;start over asking for drive
+                
+                ;-----------------------------------------------------------------------------
+                ; calCrc - update the 16-bit CRC with one more byte. 
+                ;    (Copied from M. Eberhard)
+                ; On Entry:
+                ;   a has the new byte
+                ;   crc16 is current except this byte
+                ; On Exit:
+                ;   crc16 has been updated
+                ;   Trashes a,bc
+                ;-----------------------------------------------------------------------------
+ 0342 D5        calCrc	push	d
+ 0343 E5        	push	h
+ 0344 2A5009    	lhld	crc16		;get CRC so far
+ 0347 AC        	xra	h		;XOR into CRC top byte
+ 0348 67        	mov	h,a
+ 0349 012110    	lxi	b,1021h		;bc=CRC16 polynomial
+ 034C 1608      	mvi	d,8		;prepare to rotate 8 bits
+                
+                ; do 8 bit shift/divide by CRC polynomial
+                
+ 034E 29        cRotLp	dad	h		;16-bit shift
+ 034F D25803    	jnc	cClr		;skip if bit 15 was 0
+ 0352 7C        	mov	a,h		;CRC=CRC xor 1021H
+ 0353 A8        	xra	b
+ 0354 67        	mov	h,a
+ 0355 7D        	mov	a,l
+ 0356 A9        	xra	c
+ 0357 6F        	mov	l,a
+ 0358 15        cClr	dcr	d
+ 0359 C24E03    	jnz	cRotLp		;rotate 8 times
+                
+                ; save the updated CRC and exit
+                
+ 035C 225009    	shld	crc16		;save updated CRC
+ 035F E1        	pop	h
+ 0360 D1        	pop	d
+ 0361 C9        	ret
+                
+                ;-----------------------------------------------------------------------------
+                ;  sndEot - send EOT character and wait for ACK response
+                ;-----------------------------------------------------------------------------
+ 0362 3E0A      sndEot	mvi	a,XMTRIES	;init retry counter
+ 0364 324D09    	sta	xmRetry
+                
+ 0367 3E04      reEot	mvi	a,EOT
+ 0369 CDC003    	call	sndByte
+ 036C 0603      	mvi	b,3		;3 second timeout
+ 036E CDC903    	call	rcvByte		;
+ 0371 CA7A03    	jz	eotFail		;timeout
+                
+ 0374 FE06      	cpi	ACK		;ack received?
+ 0376 C27A03    	jnz	eotFail		;no, eot send failed
+                
+ 0379 C9        	ret			;otherwise, we're done.
+                
+                ; timeout waiting for ACK to EOT. Decrement retry counter and try again
+                
+ 037A 214D09    eotFail	lxi	h,xmRetry	;point to retry counter
+ 037D 35        	dcr	m
+ 037E C26703    	jnz	reEot
+                
+                ;just give up - xfer was probably good
+                
+ 0381 21F606    	lxi	h,mNoAck
+ 0384 C38703    	jmp	dispMsg
+                
+                ;-----------------------------------------------------------------------------
+                ; dispMsg - display the null-terminated message passed in hl on the
+                ;    console device. Clobbers b, hl
+                ;-----------------------------------------------------------------------------
+ 0387 7E        dispMsg	mov	a,m		;get the next message byte
+ 0388 B7        	ora	a		;null terminates
+ 0389 C8        	rz
+                
+ 038A 47        	mov	b,a		;conOut wants character in b
+ 038B CDF307    	call	conOut
+ 038E 23        	inx	h		;move to next byte
+ 038F C38703    	jmp	dispMsg
+                
+                ;-----------------------------------------------------------------------------
+                ; rcvCon - Receive a character from the console device, echo it, then
+                ;   wait for a CR. Exits program if Ctrl-c typed. Returns with invalid
+                ;   character (null) if BS or DEL pressed after 1st character
+                ;   Returns character in a, clobbers b.
+                ;-----------------------------------------------------------------------------
+ 0392 CDEB07    rcvCon	call	conIn		;check for input
+ 0395 CA9203    	jz	rcvCon		;nothing
+                
+ 0398 E67F      	ani	7fh
+ 039A FE03      	cpi	CTRLC		;abort requested?
+ 039C CA2A04    	jz	pgmExit		;yes
+                
+ 039F FE0D      	cpi	CR		;return pressed?
+ 03A1 C8        	rz			;yes, don't echo it
+                
+ 03A2 47        	mov	b,a		;conOut needs character in b
+ 03A3 CDF307    	call	conOut		;echo it
+                
+                ; Wait for CR, then return 1st character typed
+                
+ 03A6 CDEB07    rcvCr	call	conIn		;check for input
+ 03A9 CAA603    	jz	rcvCr		;nothing
+                
+ 03AC E67F      	ani	7fh
+ 03AE FE03      	cpi	CTRLC		;abort requested?
+ 03B0 CA2A04    	jz	pgmExit		;yes
+                
+ 03B3 FE7F      	cpi	DEL		;delete
+ 03B5 C8        	rz			;yes, return DEL character
+                
+ 03B6 FE08      	cpi	BS		;backspace?
+ 03B8 C8        	rz			;yes, return BS character
+                
+ 03B9 FE0D      	cpi	CR		;return pressed?
+ 03BB C2A603    	jnz	rcvCr		;no, keep waiting
+                
+ 03BE 78        	mov	a,b		;return 1st character typed
+ 03BF C9        	ret
+                
+                ;-----------------------------------------------------------------------------
+                ; sndByte - send the byte in a through the specified transfer port. 
+                ;     Adds the byte to register e for checksum. Clobbers b.
+                ;     XMODEM send routine assumes serOut returns with a containing
+                ;     the character sent.
+                ;-----------------------------------------------------------------------------
+ 03C0 47        sndByte	mov	b,a		;b=byte to transmit
+ 03C1 83        	add	e		;update checksum
+ 03C2 5F        	mov	e,a		;e=updated checksum
+ 03C3 3A4C09    	lda	xfrPort		;a=port to use for transfer
+ 03C6 C31E08    	jmp	serOut		;send the character
+                
+                ;-----------------------------------------------------------------------------
+                ; rcvByte - Receive a byte from specified transfer port in A with B second
+                ;     timeout. If a timeout occurs, zero is returned in A and the zero 
+                ;     flag is true. Otherwise, the character is returned in A (could be
+                ;     zero) and zero flag is false. ONESEC must be set based on processor
+                ;     speed and the number of cycles in the serIn call + 59. 
+                ;     Clobbers a, b, d and e.
+                ;-----------------------------------------------------------------------------
+ 03C9 111F4B    rcvByte	lxi	d,ONESEC	;de=cycles through this loop for 1s
+                
+ 03CC 3A4C09    rcvWait	lda	xfrPort		;(13) a=port to use for transfer
+ 03CF CDFE07    	call	serIn		;(17+cycles in serIn)look for a byte
+ 03D2 C0        	rnz			;(5)byte received
+                
+ 03D3 1B        	dcx	d		;(5)otherwise, decrement timer
+ 03D4 7A        	mov	a,d		;(5)one second expire?
+ 03D5 B3        	ora	e		;(4)
+ 03D6 C2CC03    	jnz	rcvWait		;(10)no, keep waiting
+ 03D9 05        	dcr	b		;seconds left?
+ 03DA C2CC03    	jnz	rcvWait
+                
+ 03DD C9        rcvB	ret			;return with timeout (zero true and in a)
+                
+                ;-----------------------------------------------------------------------------
+                ; dspErr - display the current track and sector number which just had
+                ;     a read error. If this is the first error on a track, the track
+                ;     number is displayed first.
+                ;
+                ;  on entry:
+                ;     e = sector number
+                ;-----------------------------------------------------------------------------
+ 03DE 3A4B09    dspErr	lda	trkErr		;test track error flag
+ 03E1 B7        	ora	a
+ 03E2 C2F803    	jnz	dspSec		;track already displayed, go display sector
+                
+ 03E5 3C        	inr	a		;set track flag non-zero
+ 03E6 324B09    	sta	trkErr
+                
+                ; First error on this track. Display "Track xx errors: "
+                
+ 03E9 213707    	lxi	h,errTrk	;hl->where to put ascii decimal
+ 03EC 3AC208    	lda	trkNum		;a=track with error on it
+ 03EF CD0304    	call	bin2dec		;track to ascii
+ 03F2 212F07    	lxi	h,mTrkErr	;display the track error message
+ 03F5 CD8703    	call	dispMsg
+                
+                ; dspSec - display the sector number with an error
+                
+ 03F8 214B07    dspSec	lxi	h,errSec	;hl->where to put ascii sector
+ 03FB 7B        	mov	a,e		;a=sector where error occured
+ 03FC CD0304    	call	bin2dec
+ 03FF CD8703    	call	dispMsg		;display the error
+ 0402 C9        	ret
+                
+                ;--------------------------------------------------------------
+                ; bin2dec - Binary byte in A to 2 ASCII digits at (HL)
+                ;   HL is preserved
+                ;--------------------------------------------------------------
+ 0403 3620      bin2dec	mvi	m,' '		;assume zero supression
+ 0405 D60A      	sui	10		;value less than 10?
+ 0407 DA1504    	jc	do1s		;yes, leading blank
+ 040A 3631      	mvi	m,'1'		;have one ten already
+                
+ 040C D60A      loop10	sui	10		;count 10s
+ 040E DA1504    	jc	do1s		;done with 10s, do 1s
+ 0411 34        	inr	m
+ 0412 C30C04    	jmp	loop10
+                
+ 0415 C63A      do1s	adi	'0'+10		;form ASCII 1s digit
+ 0417 23        	inx	h		;move to 1s position
+ 0418 77        	mov	m,a
+ 0419 2B        	dcx	h		;restore hl
+ 041A C9        	ret
+                
+                ;--------------------------------------------------------------
+                ; chkQuit - check for the user to request abort (ctrl-c). If
+                ;    a character is present on the console port, read it and
+                ;    see if ctrl-c. Clobbers A
+                ;--------------------------------------------------------------
+ 041B CDEB07    chkQuit	call	conIn		;check for console input
+ 041E C8        	rz
+                
+ 041F E67F      	ani	7fh
+ 0421 FE03      	cpi	CTRLC		;abort requested?
+ 0423 C0        	rnz			;no
+                
+                ; Ctrl-C typed while program is running. Return to drive prompt.
+                
+ 0424 319609    	lxi	sp,ourStk	;initialize stack pointer
+ 0427 C31701    	jmp	getDrv		;start over asking for drive num
+                
+                ;--------------------------------------------------------------
+                ; pgmExit - Exit to CP/M or to the monitor ROM based on the
+                ;    CP/M flag
+                ;--------------------------------------------------------------
+ 042A 3A5409    pgmExit	lda	cpmFlag		;running under CP/M?
+ 042D B7        	ora	a
+ 042E C23A04    	jnz	cpmExit		;yes
+                
+                ; Exit to ROM monitor
+                
+ 0431 214F07    	lxi	h,mExit		;display "exiting" message
+ 0434 CD8703    	call	dispMsg
+ 0437 C30001    	jmp	MONITOR		;jump to ROM monitor entry point
+                
+                ; CP/M exit. If boot drive was used, prompt user to insert CP/M disk
+                
+ 043A 3AC108    cpmExit	lda	drvNum		;boot drive used?
+ 043D D600      	sui	MINDRV
+ 043F C24B04    	jnz	noDisk		;not 1, disk prompt not needed
+                
+ 0442 215F07    	lxi	h,mCpm		;display "insert cp/m disk"	
+ 0445 CD8703    	call	dispMsg
+ 0448 CD9203    	call	rcvCon		;wait for a character
+                
+ 044B 3E00      noDisk	mvi	a,MINDRV	;re-select drive A for CP/M 1.4
+ 044D 32C108    	sta	drvNum
+ 0450 CDA208    	call	dSelDrv
+                
+ 0453 214F07    	lxi	h,mExit		;display "exiting" message
+ 0456 CD8703    	call	dispMsg
+ 0459 C30000    	jmp	CPMBOOT		;reboot CP/M
+                
+                ;--------------------------------------------------------------
+                ; chkCpm - check if running under CP/M. CP/M flag is set true
+                ;   (non-zero) if yes, cleared otherwise.
+                ;--------------------------------------------------------------
+                ; First, initialize entries for stand-alone
+                
+ 045C AF        chkCpm	xra	a
+ 045D 325409    	sta	cpmFlag		;clear CP/M flag
+ 0460 3E30      	mvi	a,MINDRV+'0'	;ascii for minimum drive number
+ 0462 32DB05    	sta	mDrvMin		;store in the drive prompt message
+ 0465 325509    	sta	baseDrv		;ascii 1st drive - baseDrv = 0
+ 0468 3E33      	mvi	a,MAXDRV+'0'	;ascii for max drive number
+ 046A 32DD05    	sta	mDrvMax
+                
+                ; Determine if we're under CP/M or standalone. CP/M is assumed if
+                ;   a jump instruction is present at the CP/M warm start location (0)
+                ;   and five more jumps (e.g., a jump table) is present at the
+                ;   jump-to destination.
+                		
+ 046D 3A0000    	lda	WBOOT		;see if jump instruction present for CP/M
+ 0470 FEC3      	cpi	JMPINST
+ 0472 C0        	rnz			;no, not CP/M
+                
+                ; A jump instruction is present at the CP/M warm boot location (0),
+                ;   now see if that jump points to five more jumps. If so, assume CP/M
+                
+ 0473 210100    	lxi	h,WBOOT+1	;point to lsb of jump address
+ 0476 5E        	mov	e,m		;e=low byte of jump
+ 0477 23        	inx	h
+ 0478 56        	mov	d,m		;de=destination of jump
+ 0479 0605      	mvi	b,5		;look for 5 more jumps (a jump table)
+                
+ 047B 1A        jmpTest	ldax	d		;a=opcode at jump destination
+ 047C D6C3      	sui	JMPINST		;another jump present?
+ 047E C0        	rnz			;no, not CP/M
+ 047F 13        	inx	d		;move to next jump
+ 0480 13        	inx	d
+ 0481 13        	inx	d
+ 0482 05        	dcr	b
+ 0483 C27B04    	jnz	jmpTest
+                
+ 0486 3D        	dcr	a		;a=0ffh
+ 0487 325409    	sta	cpmFlag		;CP/M flag to non-zero = true
+                
+                ; We're running under CP/M. Change drive prompt message to show drive
+                ;    letters instead of drive numbers and change baseDrv to convert
+                ;    an 'A' to the base drive number (MINDRV).
+                
+ 048A 3E41      	mvi	a,'A'		;'A' in drive message instead of number
+ 048C 32DB05    	sta	mDrvMin
+ 048F C603      	adi	MAXDRV-MINDRV	;max drive letter
+ 0491 32DD05    	sta	mDrvMax
+ 0494 3E61      	mvi	a,'a'		;ascii 1st drive - baseDrv = 0
+ 0496 325509    	sta	baseDrv
+ 0499 C9        	ret
+                
+                ;------------------------------------------------------------------
+                ; sizeRam - determine how much RAM we have for buffering tracks.
+                ;   Sets the bufEnd variable which points to end address of 
+                ;   the last possible track buffer + 1
+                ;------------------------------------------------------------------
+                ; If running under CP/M, use the BIOS pointer to determine the top
+                ;    of available RAM. Otherwise, size RAM manually.
+                
+ 049A 2A0100    sizeRam	lhld	WBOOT+1		;get address of BIOS jump table+3
+ 049D 2B        	dcx	h		
+ 049E 2B        	dcx	h
+ 049F 2B        	dcx	h		;hl->top of usable ram+1
+ 04A0 3A5409    	lda	cpmFlag		;running under CP/M?
+ 04A3 B7        	ora	a
+ 04A4 C2B504    	jnz	ramEnd		;yes, we have the end of RAM
+                
+                ;  Not under CP/M. Find the end of RAM manually.
+                
+ 04A7 21000C    	lxi	h,(trkBuf+0ffh) AND 0ff00h   ;next 256 byte boundary
+                
+ 04AA 7E        ramLoop	mov	a,m		;a=current RAM content
+ 04AB 34        	inr	m		;change RAM
+ 04AC BE        	cmp	m		;did RAM change?
+ 04AD 77        	mov	m,a		;restore RAM
+ 04AE CAB504    	jz	ramEnd		;end of RAM found
+                
+ 04B1 24        	inr	h		;next page
+ 04B2 C2AA04    	jnz	ramLoop
+                
+                ; ramEnd - end of RAM found. Now determine the end address + 1 of the
+                ;   last track buffer that will fit in RAM. Store in bufEnd
+                
+ 04B5 EB        ramEnd	xchg			;de=end of RAM + 1
+ 04B6 3EF2      	mvi	a,-((TRKLEN SHR 8) + 1) AND 0ffh
+ 04B8 BA        	cmp	d		;force de < (10000h - TRKLEN)
+ 04B9 D2BD04    	jnc	topOk
+                
+ 04BC 57        	mov	d,a		;limit max address
+                
+ 04BD 215C0B    topOk	lxi	h,trkBuf	;hl=start of track buffer
+ 04C0 01000D    	lxi	b,TRKLEN	;bc=length of track in bytes
+                
+                ; Loop increasing hl by TRKLEN until hl > end of RAM.
+                
+ 04C3 09        bfEndLp	dad	b		;hl=hl+track length
+ 04C4 CDD604    	call	cmpHlDe		;compare hl-de
+ 04C7 DAC304    	jc	bfEndLp		;still more room, keep going
+                
+                ; Subtrack three track lengths from hl, this will be the end address + 1 of
+                ;   the last track buffer that will fit in RAM
+                
+ 04CA 0100D9    	lxi	b,-TRKLEN*3	;subtract three track lengths
+ 04CD 09        	dad	b
+ 04CE 01000C    	lxi	b,XTRALEN	;room for 50 sector track 1
+ 04D1 09        	dad	b		;hl = end address of last track + 1
+ 04D2 22C708    	shld	bufEnd		;save as bufEnd
+ 04D5 C9        	ret
+                
+                ;--------------------------------------------------------------------
+                ; cmHlDe - compare HL-DE. Carry set if HL<DE, carry clear if HL>=DE
+                ;--------------------------------------------------------------------
+ 04D6 7D        cmpHlDe	mov	a,l		;compare HL-DE, do lsbs first
+ 04D7 93        	sub	e
+ 04D8 7C        	mov	a,h		;do msbs
+ 04D9 9A        	sbb	d
+ 04DA C9        	ret			;carry set HL<DE, clear HL>=DE
+                
+                ;--------------------------------------------------------------------
+                ; cmDeHl - compare DE-HL. Carry set if DE<HL, carry clear if DE>=HL
+                ;--------------------------------------------------------------------
+ 04DB 7B        cmpDeHl	mov	a,e		;compare DE-HL, do lsbs first
+ 04DC 95        	sub	l
+ 04DD 7A        	mov	a,d		;do msbs
+ 04DE 9C        	sbb	h
+ 04DF C9        	ret			;carry set DE<HL, clear DE>=HL
+                
+                ;--------------------------------------------------------------------
+                ; subDeHl - HL=DE-HL
+                ;--------------------------------------------------------------------
+ 04E0 7B        subDeHl	mov	a,e		;subtract DE-HL, do lsbs first
+ 04E1 95        	sub	l
+ 04E2 6F        	mov	l,a		;lsb result in l
+ 04E3 7A        	mov	a,d		;do msbs
+ 04E4 9C        	sbb	h
+ 04E5 67        	mov	h,a		;msb result in h	
+ 04E6 C9        	ret
+                
+                ;--------------------------------------------------------------------
+                ; delayMs - delay number of MS specified in A. Clobbers B.
+                ;    Be sure to set the ONEMS equate as required for the
+                ;    target CPU.
+                ;--------------------------------------------------------------------
+ 04E7 0669      delayMs	mvi	b,ONEMS		;loops for 1ms
+                	
+ 04E9 00        dlyLoop	nop			;(4)
+ 04EA 05        	dcr	b		;(5 or 4)
+ 04EB C2E904    	jnz	dlyLoop		;(10)
+                
+ 04EE 3D        	dcr	a		;decrement ms counter
+ 04EF C2E704    	jnz	delayMs
+                
+ 04F2 C9        	ret
+                
+                ;---------------------------------------------------------------------
+                ; Message constants
+                ;---------------------------------------------------------------------
+ 04F3 0D0A0A    mWelcom	db	cr,lf,lf
+ 04F6 3D3D3D3D3D	db	'===== Floppy to PC Disk Image Transfer =====',cr,lf
+ 0524 2020202020	db	'       (Tarbell Controller, ver 1.1)',cr,lf,lf
+ 054B 53656E6473	db	'Sends an image of a SSSD 8" floppy to a PC via an 88-2SIO'
+ 0584 0D0A      	db	cr,lf
+ 0586 6F72203838	db	'or 88-SIO serial port using the XMODEM protocol.',0
+                
+ 05B7 0D0A0A496EmDrive	db	cr,lf,lf,'Insert and specify source drive ('
+ 05DB 782D      mDrvMin	db	'x-'
+ 05DD 7829206F72mDrvMax	db	'x) or X to exit: ',0
+                
+ 05EF 0D0A0A    mPort	db	cr,lf,lf
+ 05F2 5370656369	db	'Specify the port to use for file transfer',cr,lf
+ 061D 2020312920	db	'  1) 88-2SIO port A (which is also the console)',cr,lf
+ 064E 2020322920	db	'  2) 88-2SIO port B',cr,lf
+ 0663 2020332920	db	'  3) 88-SIO',cr,lf
+ 0670 456E746572	db	'Enter 1-3 or X to exit: ',0
+                
+ 0689 0D0A0A5374mStart	db	cr,lf,lf,'Start XMODEM receive operation on the PC now...',0
+                
+ 06BC 0D0A0A5472mDone	db	cr,lf,lf,'Transfer complete!',cr,lf,0
+                
+ 06D4 0D0A0A584DmXmdm	db	cr,lf,lf,'XMODEM communication failure',cr,lf,0
+                
+ 06F6 0D0A0A4E6FmNoAck	db	cr,lf,lf,'No ACK received on EOT.',cr,lf,0
+                
+ 0713 0D0A0A5365mNoTrk0	db	cr,lf,lf,'Seek to track 0 failed',cr,lf,0
+                
+ 072F 0D0A547261mTrkErr	db	cr,lf,'Track '
+ 0737 7878206661errTrk	db	'xx failed sectors: ',0
+ 074B 78782000  errSec	db	'xx ',0
+                
+ 074F 0D0A0A4578mExit	db	cr,lf,lf,'Exiting...',cr,lf,0
+                
+ 075F 0D0A0A    mCpm	db	cr,lf,lf
+ 0762 496E736572	db	'Insert CP/M disk into drive A, then press Return...',0
+                
+ 0796 0D0A0A4443mDDTO	db	cr,lf,lf,'DCM command timeout. Is DCM running?',cr,lf,0
+                
+ 07C0 0D0A0A4472mDNR	db	cr,lf,lf,'Drive Not Ready',cr,lf,0
+                
+                ;****************************************************************************
+                ;
+                ;  Hardware specific console and serial I/O routines. 
+                ;     The following four routines must be written to provide a common
+                ;     interface to the hardware on which this program is running. The
+                ;     port number specified for serIn and serOut matches the port number
+                ;     input from the operator via the port menu.
+                ;
+                ;****************************************************************************
+                
+                ; 88-2SIO Serial Board Equates
+                
+ 0010 =         s2aCtl	equ	010h		;1st port on 88-2SIO board - control register
+ 0011 =         s2aDat	equ	011h		;1st port on 88-2SIO board - data register
+ 0012 =         s2bCtl	equ	012h		;2nd port on 88-2SIO board - control register
+ 0013 =         s2bDat	equ	013h		;2nd port on 88-2SIO board - data register
+ 0001 =         s2Rdrf	equ	001h		;read data register full flag
+ 0002 =         s2Tdre	equ	002h		;transmit data register empty flag
+ 0003 =         s2Rst	equ	003h		;reset command
+ 0015 =         s28n1	equ	015h		;8N1 selection
+ 0011 =         s28n2	equ	011h		;8N2 selection
+                
+                ; 88-SIO Serial board Equates
+                
+ 0000 =         sioCtl	equ	00h		;control port
+ 0001 =         sioDat	equ	01h		;data port
+ 0001 =         sioRdrf	equ	00000001b	;-RX Data register full
+ 0080 =         sioTdre	equ	10000000b	;-TX Data register empty
+                
+                ; The rcvByte subroutine above times a one second timeout with a code
+                ;    loop that calls the hardware specific serIn routine below. ONESEC
+                ;    must be set based on processor speed and the number of cycles in 
+                ;    the serIn call + 59 cycles for the rcvByte code. 
+                
+ 4B1F =         ONESEC	equ	19231		;rcvByte loop count for 1 second
+                
+                ;----------------------------------------------------------------------------
+                ; s2Init - reset and initialize 88-2SIO ports for 8N1
+                ;----------------------------------------------------------------------------
+ 07D5 3E03      s2Init	mvi	a,s2Rst		;reset and init 2nd 88-2SIO port
+ 07D7 D312      	out	s2bCtl
+ 07D9 3E15      	mvi	a,s28n1		;transfer port as 8N1
+ 07DB D312      	out	s2bCtl
+                
+                ; if not running under CP/M, reset and init 1st 88-2SIO port
+                
+ 07DD 3A5409    	lda	cpmFlag		;running under CP/M?
+ 07E0 B7        	ora	a
+ 07E1 C0        	rnz			;yes, 2SIO already initialized
+                
+ 07E2 3E03      	mvi	a,s2Rst		;reset and init 1st 88-2SIO port
+ 07E4 D310      	out	s2aCtl
+ 07E6 3E11      	mvi	a,s28n2		;configure console for 8N2 in case Teletype
+ 07E8 D310      	out	s2aCtl
+ 07EA C9        	ret	
+                
+                ;----------------------------------------------------------------------------
+                ; conIn - input character from console
+                ;    inputs:
+                ;    outputs: z true if no character present
+                ;	      z false if character returned in a
+                ;    clobbers none
+                ;----------------------------------------------------------------------------
+ 07EB DB10      conIn	in	s2aCtl		;see if a new character is present
+ 07ED E601      	ani	s2Rdrf
+ 07EF C8        	rz			;no character, return zero status
+                
+ 07F0 DB11      	in	s2aDat		;return character and non-zero status
+ 07F2 C9        	ret	
+                
+                ;----------------------------------------------------------------------------
+                ; conOut - output character to console
+                ;    inputs: b = character to send
+                ;    clobbers a
+                ;----------------------------------------------------------------------------
+ 07F3 DB10      conOut	in	s2aCtl		;wait for OK to transmit
+ 07F5 E602      	ani	s2Tdre
+ 07F7 CAF307    	jz	conOut
+ 07FA 78        	mov	a,b		;a=character to transmit
+ 07FB D311      	out	s2aDat		;send it
+ 07FD C9        	ret
+                
+                ;----------------------------------------------------------------------------
+                ; Hardware specific I/O
+                ; serIn - input character from port specified in a
+                ;       0 = 88-2SIO port A
+                ;       1 = 88-2SIO port B
+                ;       2 = 88-SIO
+                ;    inputs: a = port to read from
+                ;    outputs: z true if no character present
+                ;	      z false if character returned in a
+                ;    clobbers none
+                ; 88-2SIO Port A: 53 cycles including return when no character present
+                ; 88-2SIO Port B: 43 cycles including return when no character present
+                ; 88-SIO: 57 cycles including return when no character present
+                ;-----------------------------------------------------------------------------
+ 07FE 3D        serIn	dcr	a		;(5)3-way test
+ 07FF CA0D08    	jz	s2InB		;(10)a was 1: 88-2SIO port B
+ 0802 F21508    	jp	sioIn		;(10)a was 2: 88-SIO
+                				;    a was 0: 88-2SIO port A
+                ; Input from 88-2SIO port A
+                
+ 0805 DB10      s2InA	in	s2aCtl		;(10+1)see if a new character is present
+ 0807 E601      	ani	s2Rdrf		;(7)
+ 0809 C8        	rz			;(10)no character, return zero status
+ 080A DB11      	in	s2aDat		;return character and non-zero status
+ 080C C9        	ret	
+                	
+                ; Input from 88-2SIO port B
+                
+ 080D DB12      s2InB	in	s2bCtl		;(10+1)see if a new character is present
+ 080F E601      	ani	s2Rdrf		;(7)
+ 0811 C8        	rz			;(10)no character, return zero status
+                
+ 0812 DB13      	in	s2bDat		;return character and non-zero status
+ 0814 C9        	ret	
+                
+                ; Input from 88-SIO
+                
+ 0815 DB00      sioIn	in	sioCtl		;(10+1)see if a new character is present
+ 0817 2F        	cma			;(4)invert Rx Data Ready flag
+ 0818 E601      	ani	sioRdrf		;(7)
+ 081A C8        	rz			;(10)no character, return zero status
+                
+ 081B DB01      	in	sioDat		;return character and non-zero status
+ 081D C9        	ret	
+                
+                ;-----------------------------------------------------------------------------
+                ; Hardware specific I/O
+                ; serOut - output character to port specified in a
+                ;       0 = 88-2SIO port A
+                ;       1 = 88-2SIO port B
+                ;       2 = 88-SIO
+                ;    inputs: a = port to transmit through
+                ;	     b = character to send
+                ;    clobbers a
+                ;-----------------------------------------------------------------------------
+ 081E 3D        serOut	dcr	a		;3-way test
+ 081F CA3008    	jz	s2OutB		;a was 1: 88-2SIO port B
+ 0822 F23B08    	jp	sioOut		;a was 2: 88-SIO
+                				;a was 0: 88-2SIO port A
+                
+                ; Send character through 88-2SIO port A
+                
+ 0825 DB10      S2OutA	in	s2aCtl		;wait for OK to transmit
+ 0827 E602      	ani	s2Tdre
+ 0829 CA2508    	jz	S2OutA
+                
+ 082C 78        	mov	a,b		;a=character to transmit
+ 082D D311      	out	s2aDat		;send it
+ 082F C9        	ret
+                
+                ; Send character through 88-2SIO port B
+                
+ 0830 DB12      s2OutB	in	s2bCtl		;wait for OK to transmit
+ 0832 E602      	ani	s2Tdre
+ 0834 CA3008    	jz	s2OutB
+                
+ 0837 78        	mov	a,b		;a=character to transmit
+ 0838 D313      	out	s2bDat		;send it
+ 083A C9        	ret
+                
+                ; Send character through 88-SIO
+                
+ 083B DB00      sioOut	in	sioCtl		;wait for OK to transmit
+ 083D E680      	ani	sioTdre
+ 083F C23B08    	jnz	sioOut		;active-low flag
+                
+ 0842 78        	mov	a,b		;a=character to transmit
+ 0843 D301      	out	sioDat		;send it
+ 0845 C9        	ret
+                
+                
+                ;****************************************************************************
+                ;
+                ; JADE Double D disk I/O routines
+                ;
+                ;****************************************************************************
+                
+                ;--------------------------------------------------------------
+                ; dRead - Read sector on current track.
+                ; On Entry:
+                ;    Drive is selected, on proper track, head loaded
+                ;    hl->sector buffer
+                ;    e = sector number to read
+                ; On Exit:
+                ;    Z flag set = good, Z flag clear = error
+                ;    clobbers h,l
+                ;--------------------------------------------------------------
+ 0846 D5        dRead:	push	d		;save d
+ 0847 7B        	mov	a,e		;set sector
+ 0848 CDDC0A    	call	SETSEC
+ 084B 3E01      	mvi	a,DCM$RDS	;dcm read sector
+ 084D CD0B0B    	call	DSK$EX		;execute on dd
+ 0850 C26208    	jnz	dRdone		;exit if error
+                
+ 0853 E5        	push	h		;save dest buffer
+ 0854 018000    	lxi	b,DD$BFL	;number of bytes to move
+ 0857 2A4000    	lhld	D$ADDR		;dd memory address
+ 085A 118003    	lxi	d,DD$BUF	;sector buffer offset
+ 085D 19        	dad	d		;hl now pts sector buf
+ 085E D1        	pop	d		;restore dest buffer
+ 085F CD3E0B    	call	BLK$MV		;perform block move
+                
+ 0862 D1        dRdone	pop	d		;restore d
+ 0863 AF        	xra	a		;clear error
+ 0864 C9        	ret			;error return
+                
+                ;--------------------------------------------------------------
+                ; dVerify - Verify sector on current track. The track is
+                ;    read to verify CRC, but not compared
+                ; On Entry:
+                ;    Drive is selected, on proper track, head loaded
+                ;    e = sector number to verify
+                ; On Exit:
+                ;    Z flag set = good, Z flag clear = error
+                ;    clobbers none
+                ;--------------------------------------------------------------
+ 0865 21C908    dVerify	lxi	h,secBuf	;hl=sector buffer, e=sector
+ 0868 C34608    	jmp	dRead		;read sector
+                
+                
+                ;--------------------------------------------------------------
+                ; dWrite - Write a sector on current track
+                ; On Entry:
+                ;    Drive is selected, on proper track, head loaded
+                ;    hl->buffer address
+                ;    e = sector number to write
+                ; On Exit:
+                ;    Z flag set = good, Z flag clear = error
+                ;   clobbers h,l
+                ;--------------------------------------------------------------
+ 086B D5        dWrite:	push	d		;save d
+ 086C 7B        	mov	a,e
+ 086D CDDC0A    	call	SETSEC
+ 0870 E5        	push	h		;save source buffer
+ 0871 018000    	lxi	b,DD$BFL	;number of bytes to move
+ 0874 2A4000    	lhld	D$ADDR		;DD memory address
+ 0877 118003    	lxi	d,DD$BUF	;sector buffer offset
+ 087A 19        	dad	d		;hl now pts cmnd blk
+ 087B EB        	xchg
+ 087C E1        	pop	h		;restore source buffer
+ 087D CD3E0B    	call	BLK$MV		;perform block move
+                	
+                ;*******( PERFORM WRITE SECTOR )***********************
+                
+ 0880 3E02      	mvi	a,DCM$WRS	;DCM write sector
+ 0882 CD0B0B    	call	DSK$EX		;execute
+ 0885 D1        	pop	d		;restore d
+ 0886 C9        	ret			;return A if error
+                	
+                ;--------------------------------------------------------------
+                ; dSeek - Seek track specified in L. Selects drive and loads
+                ;    head. If the head was not already loaded, then the E bit
+                ;    (wait for head settle one-shot) is set in fWaitHd for
+                ;    OR'ing into the subsequent read/write command.
+                ; On Entry:
+                ;    l = desired track
+                ; On Exit:
+                ;    Z flag set = good, Z flag clear = error
+                ; Clobbers none
+                ;--------------------------------------------------------------
+ 0887 F5        dSeek	push	a
+ 0888 7D        	mov	a,l		;set track number
+ 0889 CDCB0A    	call	SETTRK
+ 088C F1        	pop	a
+ 088D C9        	ret			;Jade DD will seek on write
+                
+                
+                ;--------------------------------------------------------------
+                ; dRestor - Selects drive, loads heads and restores to track 0.
+                ;    If restore fails, message display and program restarted
+                ;    at getDrv.
+                ; On Entry:
+                ;    drvNum = drive to be selected and restored to track zero
+                ; On Exit:
+                ;    drive selected and on track zero
+                ; Clobbers a
+                ;--------------------------------------------------------------
+ 088E CDA208    dRestor	call	dSelDrv		;make sure drive is selected
+                
+ 0891 78        	mov	a,DCM$LOG	;logon command seeks to track 0
+ 0892 CD0B0B    	call	DSK$EX		;Z clear and error in A
+ 0895 C8        	rz			;success
+                
+                ; restore failed
+                
+ 0896 211307    	lxi	h,mNoTrk0
+                
+ 0899 CD8703    errMsg	call	dispMsg
+ 089C 319609    	lxi	sp,ourStk	;initialize stack pointer
+ 089F C31701    	jmp	getDrv		;start over asking for drive num
+                
+                ;--------------------------------------------------------------
+                ; dSelDrv - Select and wait for drive specified in drvNum 
+                ;    to be ready.
+                ; On Entry:
+                ;    drvNum = drive to be selected
+                ; On Exit:
+                ;    drive selected and ready, 1771 not busy
+                ; Clobbers a
+                ;--------------------------------------------------------------
+ 08A2 3AC108    dSelDrv	lda	drvNum		;a=desired drive
+ 08A5 CDC70A    	call	SETDRV
+ 08A8 C9        	ret
+                
+                ;--------------------------------------------------------------
+                ; dNxtSec - wait for next (any) sector. For the 1771, this
+                ;    routine simply increments and wraps the sector number
+                ;    passed in e, then falls into dWtSec to return bc with
+                ;    the offset of the sector within the track buffer.
+                ; On Entry:
+                ;    Drive is selected, motor is running
+                ;    e = most recent sector number
+                ; On Exit:
+                ;    e = next sector sector number
+                ;    bc = byte offset of this sector in a track
+                ;--------------------------------------------------------------
+ 08A9 1C        dNxtSec	inr	e		;move to next staggered sector
+ 08AA 1C        	inr	e		;skew of 2
+                
+ 08AB 3AC308    	lda	numSecs
+ 08AE 47        	mov	b,a
+ 08AF 04        	inr	b
+ 08B0 7B        	mov	a,e		;see if past end
+ 08B1 B8        	cmp	b		;verify between 1 and 26/50
+ 08B2 DAB708    	jc	dWtSec		;good sector, compute bc
+                
+ 08B5 1E01      dSec1	mvi	e,1		;restart at sector 1
+                				;fall into dWtSec
+                
+                ;--------------------------------------------------------------
+                ; dWtSec - wait for sector specified in e. For the DD
+                ;    controller, this routine simply returns the offset
+                ;    of the sector within this track in bc.
+                ; On Entry:
+                ;    Drive is selected, motor is running
+                ;    e = desired sector number (must be 1-50 for DD)
+                ; On Exit:
+                ;    e = sector number
+                ;    bc = byte offset of this sector in a track
+                ;--------------------------------------------------------------
+ 08B7 7B        dWtSec	mov	a,e		;save the computed sector
+                
+                ; compute bc=128*(sector-1)
+                
+ 08B8 D601      	sui	1		;zero index and clear carry
+ 08BA 1F        	rar
+ 08BB 47        	mov	b,a		;b=sector >> 1
+                
+ 08BC 1F        	rar			;put lsbit into msbit	
+ 08BD E680      	ani	80h
+ 08BF 4F        	mov	c,a		;bc=128*e
+ 08C0 C9        	ret
+                
+                
+                ;**************************************************************************
+                ; 
+                ;  Data area
+                ;
+                ;**************************************************************************
+                ; disk variables
+                
+ 08C1           drvNum	ds	1		;drive number to use
+ 08C2           trkNum	ds	1		;track number to read
+ 08C3           numSecs	ds	1		;number of sectors in track
+ 08C4           fWaitHd	ds	1		;E bit (wait head settle) flag
+ 08C5           trkPtr	ds	2		;pointer into trkBuf at track boundaries
+ 08C7           bufEnd	ds	2		;end address + 1 of last track spot in RAM
+ 08C9           secBuf	ds	SECLEN		;sector buffer for reads
+                
+                ; retry logic variables
+                
+ 0949           rdRtry	ds	1		;disk read retry counter
+ 094A           rtStep	ds	1		;current retry step
+ 094B           trkErr	ds	1		;non zero if error occured on track
+                
+                ; xmodem variables
+                
+ 094C           xfrPort	ds	1		;pseudo port for file transfer
+ 094D           xmRetry	ds	1		;xmodem retry counter
+ 094E           blkNum	ds	1		;current xmodem block number
+ 094F           crcFlag	ds	1		;non zero if using CRC instead of checksum
+ 0950           crc16	ds	2		;crc-16 result
+ 0952           sndPtr	ds	2		;pointer for start of XMODEM send
+                
+                ; misc variables
+                
+ 0954           cpmFlag	ds	1		;non-zero if running under CP/M
+ 0955           baseDrv	ds	1		;ascii 1st drive - baseDrv = 0
+ 0956           	ds	64		;stack space
+ 0996 =         ourStk	equ	$
+                
+                ; track buffer runs from here to the end of memory
+                
+ 0996           	ds	PKTLEN		;space for pre-pended unsent data
+                
+                ;------------------------------------------------------------------------------
+                ; PR$NIB - DISPLAY VALUE IN A AS A SINGLE DIGIT ASCII-HEXIDECIMAL VALUE.
+                ;------------------------------------------------------------------------------
+ 0A16 F5        PR$NIB:	PUSH	PSW
+ 0A17 C5        	PUSH	B
+                
+ 0A18 FE0A      	CPI	10		;GREATER THAN 9?
+ 0A1A DA1F0A    	JC	NIBOUT		;0-9
+ 0A1D C607      	ADI	007H
+                
+ 0A1F C630      NIBOUT	ADI	'0'
+ 0A21 47        	MOV	B,A
+ 0A22 CDF307    	CALL	conOut
+                
+ 0A25 C1        	POP	B
+ 0A26 F1        	POP	PSW
+                
+ 0A27 C9        	RET
+                
+                ;------------------------------------------------------------------------------
+                ; PR$BYT - DISPLAY VALUE IN A AS A TWO DIGIT ASCII-HEXIDECIMAL VALUE.
+                ; CLOBBERS NONE.
+                ;------------------------------------------------------------------------------
+ 0A28 F5        PR$BYT	PUSH	A
+ 0A29 C5        	PUSH	B
+ 0A2A 47        	MOV	B,A		;STORE VALUE IN B
+ 0A2B E6F0      	ANI	0F0H		;HIGH NIBBLE
+ 0A2D 0F        	RRC
+ 0A2E 0F        	RRC
+ 0A2F 0F        	RRC
+ 0A30 0F        	RRC
+ 0A31 CD160A    	CALL	PR$NIB		;PRINT THE 16'S DIGIT
+                
+ 0A34 78        	MOV	A,B
+ 0A35 E60F      	ANI	0FH
+ 0A37 CD160A    	CALL	PR$NIB		;PRINT THE 1'S DIGIT
+ 0A3A C1        	POP	B
+ 0A3B F1        	POP	A
+ 0A3C C9        	RET
+                
+                ;------------------------------------------------------------------------------
+                ; PR$WRD - DISPLAY VALUE IN HL AS A FOUR DIGIT ASCII-HEXIDECIMAL VALUE.
+                ; CLOBBERS NONE
+                ;------------------------------------------------------------------------------
+ 0A3D E5        PR$WRD	PUSH	H		;SAVE HL
+ 0A3E C5        	PUSH	B		;SAVE BC
+ 0A3F F5        	PUSH	PSW		;SAVE AF
+ 0A40 7C        	MOV	A,H		;STORE MSB IN A
+ 0A41 CD280A    	CALL	PR$BYT		;PRINT MSB
+                
+ 0A44 7D        	MOV	A,L		;STORE LSB IN A
+ 0A45 CD280A    	CALL	PR$BYT		;PRINT LSB
+ 0A48 F1        	POP	PSW
+ 0A49 C1        	POP	B
+ 0A4A E1        	POP	H
+ 0A4B C9        	RET
+                
+                ;******************************************************
+                ;********                                     *********
+                ;********  JADE DOUBLE D ROUTINES START HERE  *********
+                ;********                                     *********
+                ;******************************************************
+                
+                ;******************************************************
+                ; SET DOUBLE D SYSTEM PORT ADDRESS		      *
+                ;******************************************************
+                
+ 0043 =         D$PORT	EQU	043H	;DOUBLE D PORT ADDRESS.
+                
+                ;*******( SET USER DOUBLE D BOARD REVISION )***********
+                
+ 0001 =         TRUE	EQU	1	;SET TRUE TO LOGIC ONE.
+ 0000 =         FALSE	EQU	0	;SET FALSE TO LOGIC ZERO
+ 0000 =         REV$B	EQU	FALSE	;SET TRUE FOR REV B BOARDS.
+ 0001 =         REV$C	EQU	TRUE	;SET TRUE FOR REV C BOARDS.
+ 0000 =         MA10	EQU	FALSE	;TRUE IF MA10 JUMPED (REV-B).
+                
+                ;*******( DEFINE HALT MASK AND BASE ADDRESS)***********
+                
+                	IF	REV$B
+                DS$HLT	EQU	002H	;STATUS PORT HALT INDICATOR.
+                DS$ASW	EQU	00CH	;STATUS PORT ADDR SW MASK.
+                D$BASE	EQU	0E400H	;SYSTEM WINDOW BASE ADDRESS
+                	ENDIF
+                
+                	IF	MA10
+                D$BASE	EQU	0E000H	;SYSTEM WINDOW BASE ADDRESS
+                	ENDIF
+                
+                	IF	REV$C
+ 0001 =         DS$HLT	EQU	001H	;STATUS PORT HALT INDICATOR.
+ 000E =         DS$ASW	EQU	00EH	;STATUS PORT ADDR SW MASK.
+ E000 =         D$BASE	EQU	0E000H	;SYSTEM WINDOW BASE ADDRESS
+                	ENDIF
+                
+                ;*******( BOOTSTRAP LINKAGE ADDRESS )******************
+                
+ 0040 =         D$ADDR	EQU	0040H	;DOUBLE D ADDRESS POINTER.
+ 0042 =         D$MASK	EQU	0042H	;DOUBLE D HALT BIT ADDR.
+                
+                ;*******( DCM HARDWARE COMMANDS )**********************
+                
+ 0080 =         DC$BGN	EQU	080H	;RESET Z80A AND EXECUTE.
+ 0001 =         DC$MRQ	EQU	001H	;REQUEST MEMORY WINDOW.
+ 0000 =         DC$MRT	EQU	000H	;RELEASE MEMORY WINDOW.
+ 0001 =         DC$MB0	EQU	001H	;SELECT MEMORY BANK 0.
+ 0003 =         DC$MB1	EQU	003H	;SELECT MEMORY BANK 1.
+ 0002 =         DC$EXC	EQU	002H	;ISSUE DOUBLE D INTERRUPT.
+                
+                ;*******( DCM MEMORY ADDRESSES DEFINED )***************
+                
+ 0370 =         DD$CBT	EQU	0370H	;COMMAND BLOCK  (BANK 0).
+ 0380 =         DD$BUF	EQU	0380H	;SECTOR BUFFER  (BANK 0).
+ 0080 =         DD$BFL	EQU	128	;SECTOR BUFFER LENGTH.
+ 0300 =         DD$FBF	EQU	0300H	;FORMAT BUFFER	(BANK 1).
+ 0100 =         DD$FBL	EQU	0100H	;FORMAT BUFFER LENGTH.
+ 03A0 =         DD$DPB	EQU	03A0H	;ID SEC DPB	(BANK 0).
+ 03B1 =         DD$DDF	EQU	03B1H	;ID SEC FLAGS	(BANK 0).
+                
+                ;*******( DCM COMMANDS )*******************************
+                
+ 0000 =         DCM$LOG	EQU	000H	;LOG ON DISKETTE.
+ 0001 =         DCM$RDS	EQU	001H	;READ SECTOR.
+ 0002 =         DCM$WRS	EQU	002H	;WRITE SECTOR.
+ 0003 =         DCM$FMT	EQU	003H	;FORMAT TRACK.
+ 0004 =         DCM$ADR	EQU	004H	;ADDRESS.
+ 0005 =         DCM$LST	EQU	005H	;LIST CHARACTER.
+ 0006 =         DCM$LCK	EQU	006H	;LIST STATUS.
+ 0007 =         DCM$IDL	EQU	007H	;IDLE.
+                
+                ;*******( STATUS BIT DEFINITIONS )*********************
+                
+ 0080 =         ST$DNR	EQU	080H	;DRIVE NOT READY
+ 0040 =         ST$WRP	EQU	040H	;WRITE PROTECTED
+ 0020 =         ST$BT5	EQU	020H	;NOT ASSIGNED
+ 0010 =         ST$RNF	EQU	010H	;RECORD NOT FOUND
+ 0008 =         ST$CRC	EQU	008H	;CRC ERROR
+ 0004 =         ST$LDE	EQU	004H	;LOST DATA ERROR
+ 0002 =         ST$HME	EQU	002H	;DRIVE HOME ERROR
+ 0001 =         ST$TSD	EQU	001H	;TWO SIDES FLAG (FORMAT)
+ 0000 =         ST$NOE	EQU	000H	;NO ERROR
+                
+                ;******************************************************
+                ; INIT DOUBLE D AND EXECUTE LOGON COMMAND	      *
+                ;******************************************************
+                
+ 0A4C DB43      INI$DD:	IN	D$PORT		;INPUT STATUS PORT.
+ 0A4E E60E      	ANI	DS$ASW		;MASK FOR ADDR SWS.
+ 0A50 07        	RLC			;POSITION BITS.
+ 0A51 F6E0      	ORI     D$BASE SHR 8	;OR IN BASE ADDR.
+ 0A53 67        	MOV	H,A		;HIGH BYTE VALUE.
+ 0A54 2E00      	MVI	L,0		;LOW BYTE VALUE.
+ 0A56 224000    	SHLD    D$ADDR		;STORE THE ADDRESS
+                
+ 0A59 3E01      	MVI	A,DS$HLT	;LOAD HALT BIT MASK.
+ 0A5B 324200    	STA	D$MASK		;STORE FOR BIOS USE.
+                
+ 0A5E 3AC108    	LDA	drvNum		;SET DRIVE NUMBER
+ 0A61 32550B    	STA	DCM$DRV
+                
+ 0A64 AF        	XRA	A		;SET TRACK NUMBER
+ 0A65 32560B    	STA	DCM$TRK
+                
+ 0A68 3C        	INR	A		;SET SECTOR NUMBER
+ 0A69 32570B    	STA	DCM$SEC
+                	
+ 0A6C 78        	MOV	A,DCM$LOG	;TRY THE LOGON COMMAND
+ 0A6D CD0B0B    	CALL	DSK$EX		;Z CLEAR AND ERROR IN A
+                
+ 0A70 C9        	RET
+                
+                ;******************************************************
+                ; PUT DCM DISK BUFFER FROM SOURCE IN HL		      *
+                ;******************************************************
+                
+ 0A71 3E01      PUT$DB:	MVI	A,DC$MB0	;REQUEST BANK 0
+ 0A73 D343      	OUT	D$PORT
+                
+ 0A75 EB        	XCHG			;HL TO DE
+ 0A76 018000    	LXI	B,DD$BFL	;NMBR BYTE TO MOVE.
+ 0A79 2A4000    	LHLD	D$ADDR		;DD SYS ADDRESS.
+ 0A7C 117003    	LXI	D,DD$CBT	;COMMAND BYTE OFFSET.
+ 0A7F 19        	DAD	D		;HL NOW PTS CMND BLK.
+ 0A80 EB        	XCHG			;HL=SRC DE=SEC BUF
+ 0A81 CD3E0B    	CALL	BLK$MV		;PERFORM BLOCK MOVE.
+ 0A84 C9        	RET
+                
+                ;******************************************************
+                ; GET DCM DISK BUFFER AND STORE IN HL		      *
+                ;******************************************************
+                
+ 0A85 3E01      GET$DB:	MVI	A,DC$MB0	;REQUEST BANK 0
+ 0A87 D343      	OUT	D$PORT
+                
+ 0A89 EB        	XCHG			;HL TO DE
+ 0A8A 018000    	LXI	B,DD$BFL	;NMBR BYTE TO MOVE.
+ 0A8D 2A4000    	LHLD	D$ADDR		;DD SYS ADDRESS.
+ 0A90 117003    	LXI	D,DD$CBT	;COMMAND BYTE OFFSET.
+ 0A93 19        	DAD	D		;HL NOW PTS CMND BLK.
+ 0A94 CD3E0B    	CALL	BLK$MV		;PERFORM BLOCK MOVE.
+ 0A97 C9        	RET
+                
+                ;******************************************************
+                ; GET DCM CONTROL BLOCK  			      *
+                ;******************************************************
+                
+ 0A98 3E01      GET$CB:	MVI	A,DC$MB0	;REQUEST BANK 0
+ 0A9A D343      	OUT	D$PORT
+                
+ 0A9C 010800    	LXI	B,8		;NMBR BYTE TO MOVE.
+ 0A9F 2A4000    	LHLD	D$ADDR		;DD SYS ADDRESS.
+ 0AA2 117003    	LXI	D,DD$CBT	;COMMAND BYTE OFFSET.
+ 0AA5 19        	DAD	D		;HL NOW PTS CMND BLK.
+ 0AA6 11540B    	LXI	D,DCM$CMD	;JDDUTIL CMND BLOCK.
+ 0AA9 CD3E0B    	CALL	BLK$MV		;PERFORM BLOCK MOVE.
+ 0AAC C9        	RET
+                
+                ;******************************************************
+                ; PUT DCM CONTROL BLOCK  			      *
+                ;******************************************************
+                
+ 0AAD 3E01      PUT$CB:	MVI	A,DC$MB0	;REQUEST BANK 0
+ 0AAF D343      	OUT	D$PORT
+                
+ 0AB1 010700    	LXI	B,7		;NMBR BYTE TO MOVE.
+ 0AB4 2A4000    	LHLD	D$ADDR		;DD SYS ADDRESS.
+ 0AB7 117003    	LXI	D,DD$CBT	;COMMAND BYTE OFFSET.
+ 0ABA 19        	DAD	D
+ 0ABB EB        	XCHG			;DE NOW PTS CMND BLK.
+ 0ABC 21540B    	LXI	H,DCM$CMD	;PC2FLOP CMND BLOCK.
+ 0ABF CD3E0B    	CALL	BLK$MV		;PERFORM BLOCK MOVE.
+ 0AC2 C9        	RET
+                
+                ;******************************************************
+                ; SET COMMAND     				      *
+                ;******************************************************
+                
+ 0AC3 32540B    SETCMD	STA	DCM$CMD		;SAVE DCM COMMAND.
+ 0AC6 C9        	RET			;RETURN TO CALLER.
+                
+                ;******************************************************
+                ; SET DRIVE NUMBER				      *
+                ;******************************************************
+                
+ 0AC7 32550B    SETDRV	STA	DCM$DRV		;SAVE DRIVE NUMBER.
+ 0ACA C9        	RET			;RETURN TO CALLER.
+                
+                ;******************************************************
+                ; SET TRACK NUMBER				      *
+                ;******************************************************
+                
+ 0ACB 32560B    SETTRK	STA	DCM$TRK		;SAVE TRACK NUMBER.
+                
+ 0ACE 0E1A      	MVI	C,NUMSEC	;26 SECTORS PER TRACK
+ 0AD0 FE01      	CPI	1		;TRACK 1?
+ 0AD2 C2D70A    	JNZ	NTRK1		;NOT TRACK 1
+ 0AD5 0E32      	MVI	C,NUMSEC1	;50 SECTORS PER TRACK
+                
+ 0AD7 79        NTRK1	MOV	A,C
+ 0AD8 32C308    	STA	numSecs
+ 0ADB C9        	RET			;RETURN TO CALLER.
+                
+                ;******************************************************
+                ; SET SECTOR NUMBER				      *
+                ;******************************************************
+                
+ 0ADC 32570B    SETSEC:	STA	DCM$SEC		;SAVE SECTOR NUMBER.
+ 0ADF C9        	RET			;RETURN TO CALLER.
+                
+                ;******************************************************
+                ; READ SECTOR - BUFFER TO STORE IN HL. DCM.TRK AND    *
+                ; DCM.SEC ARE SET UPON ENTRY			      *
+                ;******************************************************
+                
+ 0AE0 3E01      RDSEC:	MVI	A,DCM$RDS	;DCM READ SECTOR
+ 0AE2 CD0B0B    	CALL	DSK$EX		;EXECUTE ON DD
+                
+ 0AE5 E5        	PUSH	H		;SAVE DEST BUFFER
+ 0AE6 018000    	LXI	B,DD$BFL	;NMBR BYTE TO MOVE.
+ 0AE9 2A4000    	LHLD	D$ADDR		;DD SYS ADDRESS.
+ 0AEC 118003    	LXI	D,DD$BUF	;SECTOR BUFFER OFFSET
+ 0AEF 19        	DAD	D		;HL NOW PTS SECTOR BUF.
+ 0AF0 D1        	POP	D		;RESTORE DEST BUFFER
+ 0AF1 CD3E0B    	CALL	BLK$MV		;PERFORM BLOCK MOVE.
+                	
+ 0AF4 C9        	RET			;ERROR RETURN.
+                
+                ;******************************************************
+                ; WRITE SECTOR - BUFFER TO WRITE IN HL. DCM.TRK AND   *
+                ; DCM.SEC ARE SET UPON ENTRY			      *
+                ;******************************************************
+                
+ 0AF5 E5        WRSEC:	PUSH	H		;SAVE SOURCE BUFFER
+                ;	LDA	DCM$TRK
+                ;	CALL	PR$BYT
+                ;	MVI	B,'/'
+                ;	CALL	conOut
+                ;	LDA	DCM$SEC
+                ;	CALL	PR$BYT
+ 0AF6 018000    	LXI	B,DD$BFL	;NMBR BYTE TO MOVE.
+ 0AF9 2A4000    	LHLD	D$ADDR		;DD SYS ADDRESS.
+ 0AFC 118003    	LXI	D,DD$BUF	;SECTOR BUFFER OFFSET
+ 0AFF 19        	DAD	D		;HL NOW PTS CMND BLK.
+ 0B00 EB        	XCHG
+ 0B01 E1        	POP	H		;RESTORE SOURCE BUFFER
+ 0B02 CD3E0B    	CALL	BLK$MV		;PERFORM BLOCK MOVE.
+                	
+                ;*******( PERFORM WRITE SECTOR )***********************
+                
+ 0B05 3E02      	MVI	A,DCM$WRS	;DCM WRITE SECTOR
+ 0B07 CD0B0B    	CALL	DSK$EX		;BIOS WRITE SECTOR.
+ 0B0A C9        	RET			;ERROR RETURN.
+                
+                ;******************************************************
+                ; DOUBLE D EXECUTION SUBROUTINE			      *
+                ;******************************************************
+                
+                ;*******( COMMAND BLOCK TO DOUBLE D AND EXEC )*********
+                
+ 0B0B E5        DSK$EX	PUSH	H		;SAVE H
+ 0B0C 32540B    	STA	DCM$CMD		;STORE DCM COMMAND.
+ 0B0F CDAD0A    	CALL	PUT$CB
+                
+ 0B12 3E02      	MVI	A,DC$EXC	;LOAD DD INTERRUPT.
+ 0B14 D343      	OUT	D$PORT		;ISSUE DD INTERRUPT.
+                
+                ;*******( WAIT FOR DOUBLE D HALT )*********************
+                
+ 0B16 3A4200    	LDA	D$MASK		;LOAD HALT BIT MASK.
+ 0B19 47        	MOV	B,A		;MASK IN B REGISTER.
+ 0B1A 11FFFF    	LXI	D,0FFFFH	;LOOP COUNTER
+ 0B1D DB43      WAIT	IN	D$PORT		;READ DD STATUS.
+ 0B1F A0        	ANA	B		;TEST HALT* FLAG.
+ 0B20 CA350B    	JZ	HALTED		;TEST UNTIL HALTED.
+ 0B23 1B        	DCX	D
+ 0B24 7B        	MOV	A,E
+ 0B25 B2        	ORA	D
+ 0B26 C21D0B    	JNZ	WAIT
+                
+ 0B29 219607    	LXI	H,mDDTO		;DISPLAY NO DD FOUND
+ 0B2C CD8703    	CALL	dispMsg
+ 0B2F 3E80      	MVI	A,ST$DNR	;SET DRIVE NOT READY
+ 0B31 B7        	ORA	A		;CLEAR ZERO FLAG
+ 0B32 C33C0B    	JMP	EX$DONE
+                
+                ;*******( GET DOUBLE D STATUS )************************
+                
+ 0B35 CD980A    HALTED	CALL	GET$CB
+ 0B38 3A5B0B    	LDA	DCM$STS
+ 0B3B A7        	ANA	A		;TEST FOR ERRORS.
+ 0B3C E1        EX$DONE	POP	H		;RESTORE H
+ 0B3D C9        	RET			;RETURN TO CALLER.
+                
+                ;******************************************************
+                ; BLOCK MOVE SUBROUTINE (Z80 BLOCK MOVE REGISTERS)    *
+                ;******************************************************
+                
+ 0B3E 7E        BLK$MV:	MOV	A,M		;GET BYTE.
+ 0B3F 23        	INX	H		;INC POINTER
+ 0B40 EB        	XCHG			;GET DESTINATION.
+ 0B41 77        	MOV	M,A		;PUT BYTE.
+ 0B42 23        	INX	H		;INC POINTER
+ 0B43 EB        	XCHG			;GET SOURCE.
+ 0B44 0B        	DCX	B		;ONE LESS TO DO.
+ 0B45 78        	MOV	A,B		;GET HI COUNT.
+ 0B46 B1        	ORA	C		;GET LO COUNT.
+ 0B47 C23E0B    	JNZ	BLK$MV		;FINISH LOADING.
+ 0B4A C9        	RET
+                
+                ;******************************************************
+                ; DISPLAY DCM ERROR IN A 			      *
+                ;******************************************************
+                
+ 0B4B 21C007    DCM$ER	LXI	H,mDNR		;DRIVE NOT READY
+ 0B4E E680      	ANI	ST$DNR
+ 0B50 C28703    	JNZ	dispMsg
+                
+ 0B53 C9        	RET
+                
+                ;******************************************************
+                ; DOUBLE D - DCM COMMAND BLOCK BUFFER		      *
+                ;******************************************************
+                
+ 0B54 00        DCM$CMD DB	0		;DCM COMMAND.
+ 0B55 00        DCM$DRV DB	0		;DRIVE NUMBER.
+ 0B56 00        DCM$TRK DB	0		;TRACK NUMBER.
+ 0B57 00        DCM$SEC DB	0		;SECTOR NUMBER.
+ 0B58 00        DCM$SP0 DB	0		;SPARE BYTE 0.
+ 0B59 00        DCM$CHR DB	0		;LIST CHARACTER.
+ 0B5A 00        DCM$MOD DB	00000000B	;MODE CONTROLS.
+ 0B5B 00        DCM$STS DB	0		;COMMAND STATUS.
+                
+                ;******************************************************
+                ; TRACK BUFFER RUNS FROM HERE TO THE END OF MEMORY    *
+                ;******************************************************
+                
+ 0B5C =         trkBuf	equ	$
+                
+ 0B5C           	end
