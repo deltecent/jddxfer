@@ -280,20 +280,14 @@ trk1	dad	d		;hl=start of next track in trkBuf
 	ret
 
 ;--------------------------------------------------------------------------
-; secRtry - Read error retry logic. Three retry steps are tried in
-;   the order shown below:
-;
-;   Step    Action
-;    2	Re-read RDTRIES times
-;    1	Seek out one track and back, then re-read RDTRIES times
-;    0	Seek in one track and back, then re-read RDTRIES times
+; secRtry - Read error retry logic.
 ;
 ;    Upon entry, if the error is "sector not found," then retries are
 ;    not performed since the controller has already tried to read the
 ;    address mark across three revolutions.
 ;--------------------------------------------------------------------------	
 secRtry	ani	ST$RNF		;sector not found error?
-	jnz	nxtStep		;yes, skip retries, go to next step
+	jnz	nxtSec		;yes, skip retries, go to next sector
 
 	mvi	a,RDTRIES	;init retry counter
 	sta	rdRtry
@@ -305,60 +299,17 @@ retryLp	call	dWtSec		;get bc=offset of sector e in track
 	call	chkQuit		;check for ctrl-c
 	
 	call	dRead		;read the sector
-	jz	rtDone		;success, retry is done
+	jz	nxtSec		;success, retry is done
 
 	lxi	h,rdRtry	;decrement retry counter
 	dcr	m
 	jnz	retryLp		;try again
 
-; nxtStep - move to the next retry step
-
-nxtStep	lxi	h,rtStep	;decrement to next retry step
-	dcr	m
-		
-	jz	skPast		;step 0, step in one track and come back	
-	jp	skBack		;step 1, step out one track and come back
-
-; All retry steps failed. Display the error, then jump back into the main
+; Retry failed. Display the error, then jump back into the main
 ;    read loop which will resume at the next sector.
 
 	call	dspErr		;give up, display the error
-
-; rtDone - retry logic is done. Reset the retry step counter and
-;    jump to end of sector processing above
-
-rtDone	mvi	a,2		;restart retry step counter
-	sta	rtStep
 	jmp	nxtSec
-
-;-----------------------------------------------------------------------------
-; skBack - step out then back in, retry read
-; skPast - step in then back out, retry read
-;-----------------------------------------------------------------------------
-skBack	lda	trkNum		;a=current track
-	dcr	a		;move out one track
-	jp	doBump		;not before track zero, do the step out
-
-skPast	lda	trkNum		;a=current track
-	inr	a		;move in one track
-	cpi	NUMTRK		;past end?
-	jnc	skBack		;yes, do seek back instead
-	
-doBump	mov	l,a
-	call	dSeek		;issue step out or in
-
-	mvi	a,STPREV	;delay for step direction reversal
-	call	delayMs
-
-	lxi	h,trkNum	;get desired track from trkNum
-	mov	l,m		;and put into l
-	call	dSeek		;seek back to the track
-
-	mvi	a,HDSETL	;delay head settle time after step
-	call	delayMs
-
-	call	dWtSec		;get bc=offset of sector within track
-	jmp	stpLoop		;start reads for new step
 
 ;-----------------------------------------------------------------------------
 ; sndTrks - send the tracks buffered in trkBuf via xmodem. trkPtr points
