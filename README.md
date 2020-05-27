@@ -35,3 +35,4 @@ LAST  ADDRESS 03FB
 BYTES READ 02FC
 RECORDS WRITTEN 06
 ```
+The numbers displayed by `LOAD` in the output above are only examples. Your numbers may vary.
