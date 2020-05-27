@@ -120,11 +120,9 @@ getDrv	lxi	h,mDrive	;display drive number prompt
 ; Check if DCM is running and drive status
 
 	call	INI$DD
-	jz	dcmRdy		;DCM found and running
+	jz	getPort		;DCM found and running
 	call	DCM$ER		;display DCM error
 	jmp	getDrv
-
-dcmRdy	call	dRestor		;restore to track 0 (selects drive)
 
 ; getPort - get serial port number from the user.
 
@@ -225,6 +223,7 @@ sendBuf	call	sndTrks		;send the buffered tracks via xmodem
 ;    start the program over.
 
 noExtra	call	sndEot		;send and get response for EOT
+	call	dRestor		;seek to track 0
 	lxi	h,mDone		;print the all done message
 	call	dispMsg
 	jmp	getDrv		;start over asking for a drive
@@ -1204,7 +1203,12 @@ dSeek	push	a
 ;--------------------------------------------------------------
 dRestor	call	dSelDrv		;make sure drive is selected
 
-	mov	a,DCM$LOG	;logon command seeks to track 0
+	xra	a		;Track 0 / Sector 1
+	sta	DCM$TRK
+	inr	a
+	sta	DCM$SEC
+
+	mvi	a,DCM$LOG	;logon command seeks to track 0
 	call	DSK$EX		;Z clear and error in A
 	rz			;success
 
@@ -1613,12 +1617,6 @@ RDSEC:	MVI	A,DCM$RDS	;DCM READ SECTOR
 ;******************************************************
 
 WRSEC:	PUSH	H		;SAVE SOURCE BUFFER
-;	LDA	DCM$TRK
-;	CALL	PR$BYT
-;	MVI	B,'/'
-;	CALL	conOut
-;	LDA	DCM$SEC
-;	CALL	PR$BYT
 	LXI	B,DD$BFL	;NMBR BYTE TO MOVE.
 	LHLD	D$ADDR		;DD SYS ADDRESS.
 	LXI	D,DD$BUF	;SECTOR BUFFER OFFSET
