@@ -237,6 +237,8 @@ mvDone	shld	rcvPtr		;save address where to receive next packet
 allDone	mvi	a,ACK		;ACK the final packet or EOT
 	call	sndByte
 
+	call	dRestor
+
 	lxi	h,mDone		;hl->done message
 	call	dispMsg
 	jmp	getDrv		;start over asking for drive num
@@ -1140,7 +1142,11 @@ dSeek	push	a
 ;--------------------------------------------------------------
 dRestor	call	dSelDrv		;make sure drive is selected
 
-	mov	a,DCM$LOG	;logon command seeks to track 0
+	xra	a
+	sta	DCM$TRK
+	inr	a
+	sta	DCM$SEC
+	mvi	a,DCM$LOG	;logon command seeks to track 0
 	call	DSK$EX		;Z clear and error in A
 	rz			;success
 
@@ -1515,44 +1521,6 @@ NTRK1	MOV	A,C
 
 SETSEC:	STA	DCM$SEC		;SAVE SECTOR NUMBER.
 	RET			;RETURN TO CALLER.
-
-;******************************************************
-; READ SECTOR - BUFFER TO STORE IN HL. DCM.TRK AND    *
-; DCM.SEC ARE SET UPON ENTRY			      *
-;******************************************************
-
-RDSEC:	MVI	A,DCM$RDS	;DCM READ SECTOR
-	CALL	DSK$EX		;EXECUTE ON DD
-
-	PUSH	H		;SAVE DEST BUFFER
-	LXI	B,DD$BFL	;NMBR BYTE TO MOVE.
-	LHLD	D$ADDR		;DD SYS ADDRESS.
-	LXI	D,DD$BUF	;SECTOR BUFFER OFFSET
-	DAD	D		;HL NOW PTS SECTOR BUF.
-	POP	D		;RESTORE DEST BUFFER
-	CALL	BLK$MV		;PERFORM BLOCK MOVE.
-	
-	RET			;ERROR RETURN.
-
-;******************************************************
-; WRITE SECTOR - BUFFER TO WRITE IN HL. DCM.TRK AND   *
-; DCM.SEC ARE SET UPON ENTRY			      *
-;******************************************************
-
-WRSEC:	PUSH	H		;SAVE SOURCE BUFFER
-	LXI	B,DD$BFL	;NMBR BYTE TO MOVE.
-	LHLD	D$ADDR		;DD SYS ADDRESS.
-	LXI	D,DD$BUF	;SECTOR BUFFER OFFSET
-	DAD	D		;HL NOW PTS CMND BLK.
-	XCHG
-	POP	H		;RESTORE SOURCE BUFFER
-	CALL	BLK$MV		;PERFORM BLOCK MOVE.
-	
-;*******( PERFORM WRITE SECTOR )***********************
-
-	MVI	A,DCM$WRS	;DCM WRITE SECTOR
-	CALL	DSK$EX		;BIOS WRITE SECTOR.
-	RET			;ERROR RETURN.
 
 ;******************************************************
 ; DOUBLE D EXECUTION SUBROUTINE			      *
