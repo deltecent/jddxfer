@@ -17,3 +17,22 @@ Standalone operation may be required to create a bootable disk when no other boo
 
 When copying a disk image to the PC using `Flop2PC`, the program attempts several retries, including restoring the track both from zero and from past the current track. If the read still fails, the error is noted and the copy process continues so that the remainder of the disk can still be recovered. 
 
+## Loading on CP/M
+Following is a way to get `Flop2PC` onto a CP/M system for the first time using `PIP` and `LOAD` on the CP/M system. This requires a terminal emulator or file transfer program that can insert a delay between each character sent.  First, `PIP` is used to copy the Intel Hex version of `Flop2PC` to the CP/M system and save it as `FLOP2PC.HEX`, then `LOAD` is used to create the executable `FLOP2PC.COM`
+
+```
+A>PIP FLOP2PC.HEX=CON:[H]
+```
+Press `RETURN` and wait for CP/M to load `PIP` at which time you’ll see a line-feed. (There is no space between `:` and `[H]`)
+
+Assuming Tera-Term, use the `Setup->Serial Port...` menu option to set the transmit delay for `msec/char` to `10`. Then send the file `FLOP2PC.HEX` using simple ASCII transfer. You will see the hex file displayed as it is transfers. It is OK if some lines don’t display at the left edge of the screen. File transfer will continue for a while after the file transfer dialog box closes. This is normal.
+
+When file transfer is complete, type Ctrl-Z to signal end-of-file. `PIP` will exit to the `A>` prompt after a short delay for CP/M to warm start.
+```
+A>LOAD FLOP2PC
+FIRST ADDRESS 0100
+LAST  ADDRESS 03FB
+BYTES READ 02FC
+RECORDS WRITTEN 06
+```
+The numbers displayed by `LOAD` in the output above are only examples. Your numbers may vary.
