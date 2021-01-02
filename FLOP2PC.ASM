@@ -883,7 +883,7 @@ dlyLoop	nop			;(4)
 ;---------------------------------------------------------------------
 mWelcom	db	cr,lf,lf
 	db	'===== Floppy to PC Disk Image Transfer =====',cr,lf
-	db	'       (Tarbell Controller, ver 1.1)',cr,lf,lf
+	db	'          (JADE Double D, ver 1.0)',cr,lf,lf
 	db	'Sends an image of a SSSD 8" floppy to a PC via an 88-2SIO'
 	db	cr,lf
 	db	'or 88-SIO serial port using the XMODEM protocol.',0
