@@ -1190,7 +1190,7 @@
                 
  08C7 3ADF08    	lda	numSecs
  08CA 47        	mov	b,a
- 08CB 04        	inr	b
+ 08CB 04        	inr	b		;numSecs + 1
  08CC 7B        	mov	a,e		;see if past end
  08CD B8        	cmp	b		;verify between 1 and 26/50
  08CE DAD308    	jc	dWtSec		;good sector, compute bc

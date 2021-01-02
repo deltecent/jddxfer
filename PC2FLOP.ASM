@@ -1188,7 +1188,7 @@ dNxtSec	inr	e		;move to next sector
 
 	lda	numSecs
 	mov	b,a
-	inr	b
+	inr	b		;numSecs + 1
 	mov	a,e		;see if past end
 	cmp	b		;verify between 1 and 26/50
 	jc	dWtSec		;good sector, compute bc
